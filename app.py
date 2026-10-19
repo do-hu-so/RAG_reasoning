@@ -23,6 +23,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from RAG.gen import create_llm, describe_llm
 from webapp.config import WebSettings
 from webapp.service import ServiceError, describe_error, get_service
 
@@ -51,15 +52,23 @@ def handle_service_error(request, error: ServiceError) -> JSONResponse:
 @app.get("/api/health")
 def health() -> dict:
     settings = WebSettings()
+    try:
+        llm_providers = describe_llm(create_llm(gemini_model=settings.llm_model))
+    except ValueError:
+        llm_providers = []
     status = {
-        "llm_model": settings.llm_model,
-        "embedding_model": settings.embedding_model,
-        "gemini_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
+        # Thứ tự dự phòng: hết quota ở nhà cung cấp đầu thì chuyển sang nhà cung cấp sau
+        "llm_providers": llm_providers,
+        "llm_configured": bool(llm_providers),
+        "embedding_model": None,
         "max_upload_mb": settings.max_upload_mb,
         "max_documents": settings.max_documents_per_conversation,
     }
     try:
-        status["storage"] = get_service().storage.name
+        service = get_service()
+        status["storage"] = service.storage.name
+        embedder = service.embedder
+        status["embedding_model"] = embedder.model if embedder is not None else None
     except ServiceError as error:
         status["storage"] = None
         status["storage_error"] = error.message

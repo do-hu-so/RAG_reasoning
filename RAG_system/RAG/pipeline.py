@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 
-from .gen import GeminiClient, LLMClient, load_prompts
+from .gen import LLMClient, create_llm, load_prompts
 from .ingest import PDF_Ingestor
 from .reasoning import (
     OUT_OF_SCOPE_MESSAGE,
@@ -80,8 +80,9 @@ class RAGPipeline:
         self.settings = settings or RAGSettings()
 
         # Khởi tạo LLM trước để báo lỗi thiếu API key ngay, trước khi tải các model lớn
-        self.llm: LLMClient = llm or GeminiClient(
-            model=self.settings.llm_model,
+        # Gemini / Groq / API tương thích OpenAI, tự chuyển khi một bên hết quota
+        self.llm: LLMClient = llm or create_llm(
+            gemini_model=self.settings.llm_model,
             thinking_level=self.settings.thinking_level,
         )
         self.prompts = prompts or load_prompts(self.settings.prompt_file)

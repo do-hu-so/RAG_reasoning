@@ -922,6 +922,14 @@ mark.ev {
 }
 
 .doc-summary { margin: 12px 0 0; color: var(--text-muted); font-size: 14px; }
+.doc-warning {
+  margin: 12px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 13px;
+}
 .doc-summary.loading { color: var(--text-faint); }
 
 .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }

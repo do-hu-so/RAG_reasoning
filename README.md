@@ -67,6 +67,25 @@ Mở http://127.0.0.1:8000. File upload được lưu trong thư mục `dataset_
 
 Nếu bạn tạo Blob store ở chế độ **Public**, cần đặt thêm biến `BLOB_ACCESS=public`.
 
+### Dùng miễn phí được nhiều hơn (tránh hết quota)
+
+Free tier của Gemini khá hẹp, nhất là với model Flash mới. App hỗ trợ ghép nhiều nhà cung cấp miễn phí:
+
+| Việc | Nhà cung cấp | Biến môi trường | Ghi chú |
+|---|---|---|---|
+| Tìm kiếm | Không cần gì | — | Tìm từ khoá BM25 luôn chạy trên server, không tốn quota. Upload không bao giờ lỗi vì hết quota embedding. |
+| Embedding | Cloudflare Workers AI (`@cf/baai/bge-m3`) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Free tier tính theo "neuron"/ngày, đủ cho hàng triệu token. Cùng model với bản dòng lệnh. |
+| Embedding | Gemini (`gemini-embedding-2`) | `GEMINI_API_KEY` | Dùng khi không có Cloudflare. |
+| Trả lời | Gemini | `GEMINI_API_KEY` | Chất lượng tốt, quota thấp. |
+| Trả lời | **Groq** (`openai/gpt-oss-120b`) | `GROQ_API_KEY` | Free tier rộng hơn nhiều (xem số liệu trong trang Limits của Groq). Lưu ý: là **Groq**, không phải **Grok** của xAI (Grok không có free tier). |
+| Trả lời | OpenRouter / API tương thích OpenAI | `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_API_KEY`, `OPENAI_COMPAT_MODEL` | Dự phòng thêm. |
+
+- Khi có nhiều nhà cung cấp LLM, app thử lần lượt theo `LLM_PROVIDERS` (mặc định `gemini,groq,openai`). Bên nào hết quota thì app tự chuyển sang bên kế tiếp, và bên đó được "nghỉ" 60 giây trước khi thử lại.
+- Muốn tiết kiệm quota Gemini: đặt `LLM_PROVIDERS=groq,gemini`.
+- Lấy key Cloudflare: vào dash.cloudflare.com, copy **Account ID**. Sau đó vào **My Profile → API Tokens**, tạo token có quyền **Workers AI** (Read).
+- Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng tìm kiếm từ khoá.
+- Embedding câu hỏi lỗi lúc hỏi: app tự dùng tìm kiếm từ khoá và ghi chú điều đó trong câu trả lời.
+
 ### Dữ liệu được lưu như thế nào
 
 ```text
@@ -75,7 +94,7 @@ dataset_web/                        (thư mục trên máy, hoặc tiền tố d
     └── <document_id>/
         ├── <tên file gốc>.pdf      file PDF đã upload
         ├── chunks.json             các đoạn văn + số trang
-        ├── embeddings.npy          vector embedding của từng đoạn
+        ├── embeddings.npy          vector embedding của từng đoạn (không có nếu chỉ tìm theo từ khoá)
         ├── meta.json               thông tin tài liệu (ghi sau cùng, đánh dấu đã xử lý xong)
         └── overview.json           tóm tắt + câu hỏi gợi ý
 ```
@@ -120,7 +139,10 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
-| `GEMINI_API_KEY` | (bắt buộc) | API key Gemini, lấy tại https://aistudio.google.com/apikey |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` | (cần ít nhất một) | API key LLM: Gemini (https://aistudio.google.com/apikey), Groq (https://console.groq.com/keys) |
+| `LLM_PROVIDERS` | `gemini,groq,openai` | Thứ tự thử các nhà cung cấp LLM khi một bên hết quota |
+| `WEB_EMBEDDING_PROVIDER` | `auto` | `auto` / `cloudflare` / `gemini` / `none` (chỉ tìm từ khoá) |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | (tuỳ chọn) | Embedding `bge-m3` qua Cloudflare Workers AI |
 | `GEMINI_MODEL` | `gemini-3.5-flash` | Model trả lời |
 | `GEMINI_THINKING_LEVEL` | `medium` | Mức suy luận: `minimal`, `low`, `medium`, `high`, `off` |
 | `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Model embedding của bản web |
@@ -153,7 +175,7 @@ Mã nguồn: `RAG_system/RAG/reasoning.py`. Prompt: `RAG_system/config_prompt_we
 ## 5. Kiểm thử
 
 ```powershell
-python test_web.py        # 12 test API web: upload, hỏi–đáp stream, lỗi, embedder (không cần API key)
+python test_web.py        # 23 test bản web: upload, hỏi–đáp stream, BM25 / hybrid, chuyển nhà cung cấp, lỗi (không cần API key)
 python test_offline.py    # 13 test lõi RAG + bản dòng lệnh (không cần API key / model)
 python test_simple.py     # kiểm tra nhanh file PDF và cấu trúc project
 ```
@@ -181,7 +203,8 @@ RAG_reasoning/
 ├── webapp/                         # Backend web
 │   ├── config.py                   # Cấu hình bản web
 │   ├── storage.py                  # Lưu trữ: thư mục dataset_web/ hoặc Vercel Blob
-│   ├── embeddings.py               # Gemini Embedding API
+│   ├── embeddings.py               # Embedding qua API: Cloudflare bge-m3 / Gemini
+│   ├── keyword_search.py           # Tìm kiếm từ khoá BM25 (không tốn quota)
 │   └── service.py                  # Upload -> chunk -> embedding; hỏi–đáp có suy luận
 ├── RAG_system/
 │   ├── RAG/                        # Lõi RAG: reasoning, gen (Gemini), settings, pipeline / ingest / reranking (CLI)

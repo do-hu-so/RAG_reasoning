@@ -368,7 +368,8 @@
       progress = h("div", { class: "progress indeterminate" }, h("span", {}));
     } else if (msg.status === "ready") {
       var meta = msg.meta || {};
-      sub = "Sẵn sàng · " + meta.pages + " trang · " + meta.chunks + " đoạn · " + formatSize(meta.size || msg.size);
+      sub = "Sẵn sàng · " + meta.pages + " trang · " + meta.chunks + " đoạn · " + formatSize(meta.size || msg.size) +
+        (meta.search === "keyword" ? " · tìm theo từ khoá" : "");
       subClass += " ok";
     } else {
       sub = msg.error || "Tải lên thất bại.";
@@ -376,6 +377,9 @@
     }
 
     var body = [];
+    if (msg.status === "ready" && msg.meta && msg.meta.warning) {
+      body.push(h("p", { class: "doc-warning" }, "⚠ " + msg.meta.warning));
+    }
     if (msg.status === "ready") {
       if (msg.overviewStatus === "loading") {
         body.push(h("p", { class: "doc-summary loading shimmer" }, "Đang đọc lướt và tóm tắt tài liệu…"));
@@ -1040,12 +1044,14 @@
       var data = await response.json();
       state.config = data;
       var storage = data.storage === "vercel-blob" ? "Vercel Blob" : data.storage === "local" ? "thư mục dataset_web/" : "chưa sẵn sàng";
+      var providers = (data.llm_providers || []).join(" → ") || "chưa cấu hình";
+      var search = data.embedding_model ? "từ khoá + ngữ nghĩa (" + data.embedding_model + ")" : "từ khoá (BM25)";
       els.serverStatus.innerHTML =
-        "<strong>Model:</strong> " + escapeHtml(data.llm_model) +
-        "<br><strong>Embedding:</strong> " + escapeHtml(data.embedding_model) +
+        "<strong>Model:</strong> " + escapeHtml(providers) +
+        "<br><strong>Tìm kiếm:</strong> " + escapeHtml(search) +
         "<br><strong>Lưu trữ:</strong> " + escapeHtml(storage);
       if (data.storage_error) showBanner(data.storage_error);
-      else if (!data.gemini_configured) showBanner("Server chưa cấu hình GEMINI_API_KEY nên chưa thể tạo embedding và trả lời câu hỏi.");
+      else if (!data.llm_configured) showBanner("Server chưa có API key cho LLM (GEMINI_API_KEY hoặc GROQ_API_KEY) nên chưa thể trả lời câu hỏi.");
       if (!current()) renderMessages();
     } catch (err) {
       els.serverStatus.textContent = "Không kết nối được server.";

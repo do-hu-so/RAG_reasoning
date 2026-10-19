@@ -47,6 +47,8 @@ class WebSettings:
     thinking_level: str = field(default_factory=lambda: _env_str("GEMINI_THINKING_LEVEL", DEFAULT_THINKING_LEVEL))
     analysis_thinking_level: str = DEFAULT_ANALYSIS_THINKING_LEVEL
 
+    # auto: Cloudflare (nếu có key) -> Gemini (nếu có key) -> chỉ tìm từ khoá; hoặc cloudflare | gemini | none
+    embedding_provider: str = field(default_factory=lambda: _env_str("WEB_EMBEDDING_PROVIDER", "auto"))
     embedding_model: str = field(default_factory=lambda: _env_str("GEMINI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
     embedding_dimensions: int = field(default_factory=lambda: _env_int("GEMINI_EMBEDDING_DIMENSIONS", 768))
 

@@ -18,7 +18,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import PurePath
@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 from langchain_core.documents import Document
 
-from RAG.gen import GeminiClient, LLMClient, fill_template, load_prompts
+from RAG.gen import LLMClient, create_llm, fill_template, load_prompts
 from RAG.reasoning import (
     QueryAnalysis,
     QueryAnalyzer,
@@ -39,7 +39,8 @@ from RAG.reasoning import (
 from read_file import TextChunker, read_pdf_pages
 
 from .config import WebSettings
-from .embeddings import Embedder, GeminiEmbedder
+from .embeddings import Embedder, create_embedder
+from .keyword_search import BM25, tokenize
 from .storage import Storage, create_storage
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,13 @@ DOCUMENT_ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 META_FILE = "meta.json"
 CHUNKS_FILE = "chunks.json"
 EMBEDDINGS_FILE = "embeddings.npy"
+
+# Hybrid search: gộp thứ hạng BM25 và embedding bằng Reciprocal Rank Fusion
+RRF_K = 60
+CANDIDATES_PER_RANKING = 30
+
+# Giá trị mặc định của tham số embedder: tự chọn theo biến môi trường
+AUTO = object()
 OVERVIEW_FILE = "overview.json"
 
 NO_DOCUMENT_MESSAGE = (
@@ -87,7 +95,13 @@ class StoredDocument:
 
     meta: Dict[str, Any]
     chunks: List[Dict[str, Any]]
-    vectors: np.ndarray
+    vectors: Optional[np.ndarray]  # None: tài liệu chỉ tìm được bằng từ khoá
+    tokens: Optional[List[List[str]]] = None  # token BM25 của từng đoạn (tính khi cần)
+
+    def keyword_tokens(self) -> List[List[str]]:
+        if self.tokens is None:
+            self.tokens = [tokenize(chunk["content"]) for chunk in self.chunks]
+        return self.tokens
 
 
 class StageTimer:
@@ -129,14 +143,18 @@ def describe_error(error: Exception) -> str:
 
     code = getattr(error, "code", None)
     text = str(error)
+    provider = getattr(error, "provider", None) or "Gemini"
     if code == 429 or "RESOURCE_EXHAUSTED" in text:
-        return "Đã vượt giới hạn gọi Gemini API (quota / rate limit). Vui lòng thử lại sau ít phút."
+        return (
+            f"{provider} đã hết quota / bị giới hạn tốc độ. Vui lòng thử lại sau ít phút, "
+            "hoặc thêm GROQ_API_KEY trên server để tự chuyển sang Groq khi một bên hết quota."
+        )
     if code in (401, 403) or "API_KEY_INVALID" in text or "API key not valid" in text:
-        return "GEMINI_API_KEY không hợp lệ hoặc không có quyền. Kiểm tra lại biến môi trường trên server."
+        return f"API key của {provider} không hợp lệ hoặc không có quyền. Kiểm tra lại biến môi trường trên server."
     if code == 404:
-        return "Model Gemini không tồn tại hoặc đã ngừng hỗ trợ. Đổi GEMINI_MODEL / GEMINI_EMBEDDING_MODEL rồi deploy lại."
+        return f"Model của {provider} không tồn tại hoặc đã ngừng hỗ trợ. Kiểm tra biến *_MODEL rồi deploy lại."
     if code is not None and code >= 500:
-        return "Dịch vụ Gemini đang gặp sự cố tạm thời. Vui lòng thử lại."
+        return f"Dịch vụ {provider} đang gặp sự cố tạm thời. Vui lòng thử lại."
     return f"Đã xảy ra lỗi: {text}"
 
 
@@ -164,14 +182,20 @@ class WebRAGService:
         self,
         settings: WebSettings,
         storage: Storage,
-        embedder: Optional[Embedder] = None,
+        embedder: Any = AUTO,
         llm: Optional[LLMClient] = None,
         prompts: Optional[Dict[str, str]] = None,
         cache_size: int = 32,
     ) -> None:
+        """
+        Args:
+            embedder: Embedder có sẵn; None = chỉ tìm kiếm từ khoá; mặc định chọn theo biến môi trường
+            llm: LLM có sẵn; mặc định tạo theo biến môi trường (Gemini / Groq / ...)
+        """
         self.settings = settings
         self.storage = storage
-        self._embedder = embedder
+        self._embedder = None if embedder is AUTO else embedder
+        self._embedder_ready = embedder is not AUTO
         self._llm = llm
         self.prompts = prompts or load_prompts(settings.prompt_file)
         self._cache: "OrderedDict[str, StoredDocument]" = OrderedDict()
@@ -180,16 +204,22 @@ class WebRAGService:
 
     # ------------------------------------------------------------------ lazy clients
     @property
-    def embedder(self) -> Embedder:
+    def embedder(self) -> Optional[Embedder]:
+        """
+        Embedder theo cấu hình; None nghĩa là chỉ dùng tìm kiếm từ khoá.
+        """
         with self._lock:
-            if self._embedder is None:
+            if not self._embedder_ready:
                 try:
-                    self._embedder = GeminiEmbedder(
-                        model=self.settings.embedding_model,
-                        dimensions=self.settings.embedding_dimensions,
+                    self._embedder = create_embedder(
+                        self.settings.embedding_provider,
+                        self.settings.embedding_model,
+                        self.settings.embedding_dimensions,
                     )
                 except ValueError as error:
-                    raise ServiceError(503, "Server chưa cấu hình GEMINI_API_KEY.") from error
+                    logger.warning("Không tạo được embedder (%s), chỉ dùng tìm kiếm từ khoá.", error)
+                    self._embedder = None
+                self._embedder_ready = True
             return self._embedder
 
     @property
@@ -197,12 +227,12 @@ class WebRAGService:
         with self._lock:
             if self._llm is None:
                 try:
-                    self._llm = GeminiClient(
-                        model=self.settings.llm_model,
+                    self._llm = create_llm(
+                        gemini_model=self.settings.llm_model,
                         thinking_level=self.settings.thinking_level,
                     )
                 except ValueError as error:
-                    raise ServiceError(503, "Server chưa cấu hình GEMINI_API_KEY.") from error
+                    raise ServiceError(503, str(error)) from error
             return self._llm
 
     # ------------------------------------------------------------------ validation
@@ -274,10 +304,24 @@ class WebRAGService:
             raise ServiceError(413, "Tài liệu quá dài, hãy tách thành nhiều file nhỏ hơn.")
 
         stored_name = _safe_filename(filename)
-        vectors = self.embedder.embed_documents(
-            [chunk["content"] for chunk in chunks],
-            title=PurePath(stored_name).stem,
-        )
+
+        # Embedding là tuỳ chọn: lỗi (hết quota, mất mạng...) thì tài liệu vẫn dùng được
+        # với tìm kiếm từ khoá BM25, không làm hỏng cả lần upload
+        embedder = self.embedder
+        vectors: Optional[np.ndarray] = None
+        warning: Optional[str] = None
+        if embedder is not None:
+            try:
+                vectors = embedder.embed_documents(
+                    [chunk["content"] for chunk in chunks],
+                    title=PurePath(stored_name).stem,
+                )
+            except Exception as error:
+                logger.warning("Không tạo được embedding cho %s: %s", filename, error)
+                warning = (
+                    f"Chưa tạo được embedding ({describe_error(error)}). "
+                    "Tài liệu vẫn hỏi được bằng tìm kiếm từ khoá."
+                )
 
         document_id = uuid.uuid4().hex[:12]
         prefix = f"{conversation_id}/{document_id}"
@@ -289,17 +333,19 @@ class WebRAGService:
             "pages": max(page["page_number"] for page in pages),
             "text_pages": len(pages),
             "chunks": len(chunks),
-            "embedding_model": self.embedder.model,
-            "dimensions": int(vectors.shape[1]),
+            "search": "hybrid" if vectors is not None else "keyword",
+            "embedding_model": embedder.model if vectors is not None else None,
+            "dimensions": int(vectors.shape[1]) if vectors is not None else None,
+            "warning": warning,
             "created_at": _now(),
         }
 
-        buffer = io.BytesIO()
-        np.save(buffer, vectors.astype(np.float32), allow_pickle=False)
-
         self.storage.put(f"{prefix}/{stored_name}", data, "application/pdf")
         self.storage.put(f"{prefix}/{CHUNKS_FILE}", json.dumps(chunks, ensure_ascii=False).encode("utf-8"), "application/json")
-        self.storage.put(f"{prefix}/{EMBEDDINGS_FILE}", buffer.getvalue(), "application/octet-stream")
+        if vectors is not None:
+            buffer = io.BytesIO()
+            np.save(buffer, vectors.astype(np.float32), allow_pickle=False)
+            self.storage.put(f"{prefix}/{EMBEDDINGS_FILE}", buffer.getvalue(), "application/octet-stream")
         # Ghi meta cuối cùng: có meta nghĩa là tài liệu đã xử lý xong
         self.storage.put(f"{prefix}/{META_FILE}", json.dumps(meta, ensure_ascii=False).encode("utf-8"), "application/json")
 
@@ -391,7 +437,9 @@ class WebRAGService:
                 return self._cache[prefix]
 
         chunks = json.loads(self.storage.get(f"{prefix}/{CHUNKS_FILE}"))
-        vectors = np.load(io.BytesIO(self.storage.get(f"{prefix}/{EMBEDDINGS_FILE}")), allow_pickle=False)
+        vectors = None
+        if meta.get("embedding_model"):
+            vectors = np.load(io.BytesIO(self.storage.get(f"{prefix}/{EMBEDDINGS_FILE}")), allow_pickle=False)
         document = StoredDocument(meta, chunks, vectors)
         self._remember(prefix, document)
         return document
@@ -401,27 +449,70 @@ class WebRAGService:
         self,
         documents: Sequence[StoredDocument],
         queries: Sequence[str],
-    ) -> List[Tuple[Document, float]]:
-        query_vectors = self.embedder.embed_queries(list(queries))
+    ) -> Tuple[List[Tuple[Document, float]], List[str]]:
+        """
+        Hybrid search: gộp thứ hạng BM25 (từ khoá) và cosine (embedding) bằng
+        Reciprocal Rank Fusion, cho mỗi truy vấn con.
 
-        candidates: List[Tuple[float, StoredDocument, int]] = []
-        for document in documents:
-            if document.vectors.shape[1] != query_vectors.shape[1]:
-                raise ServiceError(
-                    409,
-                    f'Tài liệu "{document.meta["filename"]}" được embedding bằng cấu hình khác. '
-                    "Hãy xoá và tải lên lại.",
+        Returns:
+            (các đoạn kèm độ liên quan tương đối 0-1, cảnh báo)
+        """
+        pool = [(document, index) for document in documents for index in range(len(document.chunks))]
+        fused: Dict[int, float] = defaultdict(float)
+        warnings: List[str] = []
+
+        def add_ranking(scores: np.ndarray) -> None:
+            for rank, position in enumerate(np.argsort(-scores)[:CANDIDATES_PER_RANKING]):
+                if scores[position] <= 0:
+                    break
+                fused[int(position)] += 1.0 / (RRF_K + rank + 1)
+
+        # 1) Từ khoá (BM25): luôn chạy, không tốn quota
+        bm25 = BM25([tokens for document in documents for tokens in document.keyword_tokens()])
+        for query in queries:
+            add_ranking(np.asarray(bm25.scores(tokenize(query))))
+
+        # 2) Ngữ nghĩa (embedding): chỉ với tài liệu đã có vector cùng model với embedder hiện tại
+        embedder = self.embedder
+        dense = [
+            document for document in documents
+            if embedder is not None and document.vectors is not None
+            and document.meta.get("embedding_model") == embedder.model
+        ]
+        if dense:
+            try:
+                query_vectors = embedder.embed_queries(list(queries))
+            except Exception as error:
+                logger.warning("Không tạo được embedding cho câu hỏi: %s", error)
+                query_vectors = None
+                warnings.append(
+                    f"Tìm kiếm ngữ nghĩa tạm thời không dùng được ({describe_error(error)}); "
+                    "câu trả lời dựa trên tìm kiếm từ khoá."
                 )
-            # Điểm của mỗi đoạn = cosine cao nhất với một trong các truy vấn
-            scores = (document.vectors @ query_vectors.T).max(axis=1)
-            for index in np.argsort(-scores)[: self.settings.top_n]:
-                candidates.append((float(scores[index]), document, int(index)))
+            if query_vectors is not None:
+                dense_ids = {id(document) for document in dense}
+                cosine = np.zeros((len(pool), len(queries)), dtype=np.float32)
+                offset = 0
+                for document in documents:
+                    count = len(document.chunks)
+                    if id(document) in dense_ids and document.vectors.shape[1] == query_vectors.shape[1]:
+                        cosine[offset:offset + count] = document.vectors @ query_vectors.T
+                    offset += count
+                for column in range(cosine.shape[1]):
+                    add_ranking(cosine[:, column])
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        if not fused:
+            # Không đoạn nào khớp: dùng các đoạn đầu tài liệu (hữu ích cho câu hỏi kiểu "tóm tắt")
+            ranked = [(position, 0.0) for position in range(min(self.settings.top_n, len(pool)))]
+        else:
+            ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)[: self.settings.top_n]
 
+        best = ranked[0][1] if ranked and ranked[0][1] > 0 else 1.0
         results = []
-        for score, document, index in candidates[: self.settings.top_n]:
+        for position, score in ranked:
+            document, index = pool[position]
             chunk = document.chunks[index]
+            score = score / best
             results.append((
                 Document(
                     page_content=chunk["content"],
@@ -435,7 +526,7 @@ class WebRAGService:
                 ),
                 score,
             ))
-        return results
+        return results, warnings
 
     @staticmethod
     def _result_event(
@@ -516,11 +607,12 @@ class WebRAGService:
 
         yield status("retrieving", f"Đang tìm trong {len(metas)} tài liệu")
         documents = [self._load_document(meta, conversation_id) for meta in metas]
-        hits = self._retrieve(documents, analysis.sub_queries or [analysis.standalone_question])
+        hits, search_warnings = self._retrieve(documents, analysis.sub_queries or [analysis.standalone_question])
 
         yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
         answerer = ReasoningAnswerer(self.llm, self.prompts)
         result = answerer.answer(analysis.standalone_question, [document for document, _ in hits])
+        result.warnings = search_warnings + result.warnings
 
         yield self._result_event(question, analysis, result, timer.finish(), hits)
 
