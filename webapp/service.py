@@ -14,7 +14,6 @@ Version: 1.0.0
 import io
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -147,18 +146,18 @@ def describe_error(error: Exception) -> str:
 
     code = getattr(error, "code", None)
     text = str(error)
-    provider = getattr(error, "provider", None) or "Gemini"
-    if code == 429 or "RESOURCE_EXHAUSTED" in text:
-        if os.getenv("GROQ_API_KEY"):
-            return f"{provider} đã hết quota / bị giới hạn tốc độ. Vui lòng thử lại sau ít phút."
+    provider = getattr(error, "provider", None) or "Groq"
+    if code == 429 or "rate limit" in text.lower():
         return (
-            f"{provider} đã hết quota / bị giới hạn tốc độ. Vui lòng thử lại sau ít phút, "
-            "hoặc thêm GROQ_API_KEY trên server để tự chuyển sang Groq khi một bên hết quota."
+            "Groq đã hết quota (hoặc gọi quá nhanh) cho tất cả model đang dùng. "
+            "Vui lòng thử lại sau ít phút; hạn mức theo ngày của Groq đặt lại lúc 0h UTC (7h sáng giờ Việt Nam)."
         )
-    if code in (401, 403) or "API_KEY_INVALID" in text or "API key not valid" in text:
+    if code == 413:
+        return "Câu hỏi kèm tài liệu quá dài so với giới hạn token/phút của Groq. Hãy hỏi ngắn gọn hơn."
+    if code in (401, 403):
         return f"API key của {provider} không hợp lệ hoặc không có quyền. Kiểm tra lại biến môi trường trên server."
     if code == 404:
-        return f"Model của {provider} không tồn tại hoặc đã ngừng hỗ trợ. Kiểm tra biến *_MODEL rồi deploy lại."
+        return f"Model của {provider} không tồn tại hoặc đã ngừng hỗ trợ. Kiểm tra biến GROQ_MODELS rồi deploy lại."
     if code is not None and code >= 500:
         return f"Dịch vụ {provider} đang gặp sự cố tạm thời. Vui lòng thử lại."
     return f"Đã xảy ra lỗi: {text}"
@@ -166,19 +165,19 @@ def describe_error(error: Exception) -> str:
 
 def describe_embedding_error(error: Exception) -> str:
     """
-    Thông báo khi tạo embedding lỗi.
-
-    Groq / OpenRouter không có dịch vụ embedding, nên khi embedding hết quota phải
-    gợi ý Cloudflare (hoặc tắt embedding) chứ không phải thêm nhà cung cấp LLM.
+    Thông báo khi tạo embedding (Cloudflare) lỗi.
     """
     code = getattr(error, "code", None)
-    provider = getattr(error, "provider", None) or "Gemini"
-    if code == 429 or "RESOURCE_EXHAUSTED" in str(error):
+    provider = getattr(error, "provider", None) or "Cloudflare"
+    if code == 429:
         return (
-            f"{provider} đã hết quota embedding. Groq không có dịch vụ embedding nên không thay thế được; "
-            "thêm CLOUDFLARE_ACCOUNT_ID và CLOUDFLARE_API_TOKEN (embedding bge-m3 miễn phí) "
-            "hoặc đặt WEB_EMBEDDING_PROVIDER=none để chỉ dùng tìm kiếm từ khoá"
+            f"{provider} đã hết quota embedding trong ngày; "
+            "đặt WEB_EMBEDDING_PROVIDER=none nếu chỉ muốn dùng tìm kiếm từ khoá"
         )
+    if code in (401, 403):
+        return f"{provider} từ chối truy cập: kiểm tra CLOUDFLARE_ACCOUNT_ID và quyền Workers AI của CLOUDFLARE_API_TOKEN"
+    if code is not None and code >= 500:
+        return f"dịch vụ embedding của {provider} đang gặp sự cố tạm thời"
     return describe_error(error).rstrip(".")
 
 
@@ -199,7 +198,7 @@ class WebRAGService:
     Service hỏi–đáp tài liệu PDF cho bản web.
 
     LLM và embedder được khởi tạo khi cần lần đầu, để các API không dùng đến
-    Gemini (liệt kê / xoá tài liệu, health) vẫn chạy khi chưa cấu hình API key.
+    LLM (liệt kê / xoá tài liệu, health) vẫn chạy khi chưa cấu hình API key.
     """
 
     def __init__(
@@ -214,7 +213,7 @@ class WebRAGService:
         """
         Args:
             embedder: Embedder có sẵn; None = chỉ tìm kiếm từ khoá; mặc định chọn theo biến môi trường
-            llm: LLM có sẵn; mặc định tạo theo biến môi trường (Gemini / Groq / ...)
+            llm: LLM có sẵn; mặc định các model Groq theo biến môi trường GROQ_MODELS
         """
         self.settings = settings
         self.storage = storage
@@ -239,7 +238,6 @@ class WebRAGService:
                     self._embedder = create_embedder(
                         self.settings.embedding_provider,
                         self.settings.embedding_model,
-                        self.settings.embedding_dimensions,
                     )
                 except ValueError as error:
                     logger.warning("Không tạo được embedder (%s), chỉ dùng tìm kiếm từ khoá.", error)
@@ -253,7 +251,7 @@ class WebRAGService:
             if self._llm is None:
                 try:
                     self._llm = create_llm(
-                        gemini_model=self.settings.llm_model,
+                        models=self.settings.llm_models,
                         thinking_level=self.settings.thinking_level,
                     )
                 except ValueError as error:

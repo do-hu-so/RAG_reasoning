@@ -6,7 +6,7 @@ Module này chứa các thành phần chính của hệ thống RAG:
 - ingest: Nạp dữ liệu từ PDF / .md / .txt vào FAISS (bản dòng lệnh)
 - reranking: Tìm kiếm nhiều truy vấn và sắp xếp lại kết quả
 - reasoning: Phân tích câu hỏi, suy luận có trích dẫn, kiểm chứng câu trả lời
-- gen: Kết nối LLM Google Gemini và đọc prompt
+- gen: Kết nối LLM (Groq) và đọc prompt
 - pipeline: Điều phối toàn bộ quá trình hỏi–đáp (bản dòng lệnh)
 - add_path: Quản lý đường dẫn
 

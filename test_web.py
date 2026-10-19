@@ -6,7 +6,7 @@ Dùng embedder giả (bag-of-words), LLM giả và LocalStorage trong thư mục
 2. Liệt kê / tải / xoá tài liệu, xoá cuộc trò chuyện
 3. Hỏi–đáp dạng stream (status -> result), lịch sử hội thoại, câu chào hỏi
 4. Các lỗi: file không phải PDF, quá lớn, PDF không có chữ, mã không hợp lệ
-5. GeminiEmbedder: định dạng tiền tố, tách từng vector, chuẩn hoá
+5. Groq (nhiều model dự phòng), Cloudflare embedding, BM25
 
 Chạy: python test_web.py
 
@@ -18,12 +18,12 @@ import json
 import os
 import re
 import shutil
+import time
 import sys
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -49,7 +49,7 @@ from RAG.gen import (
 )
 from RAG.reasoning import ANSWER_SCHEMA, QUERY_ANALYSIS_SCHEMA
 from webapp.config import WEB_PROMPT_FILE, WebSettings
-from webapp.embeddings import CloudflareEmbedder, GeminiEmbedder, create_embedder
+from webapp.embeddings import CloudflareEmbedder, create_embedder
 from webapp.keyword_search import BM25, tokenize
 from webapp.service import NO_DOCUMENT_MESSAGE, OVERVIEW_SCHEMA, WebRAGService, set_service
 from webapp.storage import LocalStorage
@@ -313,12 +313,12 @@ class FailingEmbedder(FakeEmbedder):
     def embed_documents(self, texts, title=None):
         self.document_calls += 1
         if self.fail_documents:
-            raise ProviderError("gemini", 429, "RESOURCE_EXHAUSTED")
+            raise ProviderError("Cloudflare", 429, "quota")
         return super().embed_documents(texts, title)
 
     def embed_queries(self, texts):
         if self.fail_queries:
-            raise ProviderError("gemini", 429, "RESOURCE_EXHAUSTED")
+            raise ProviderError("Cloudflare", 429, "quota")
         return super().embed_queries(texts)
 
 
@@ -354,10 +354,8 @@ class TestKeywordSearch(WebTestCase):
         self.assertEqual(response.status_code, 200)
         meta = response.json()
         self.assertEqual(meta["search"], "keyword")
-        # Gợi ý đúng cách xử lý: Cloudflare / tắt embedding, không phải Groq (Groq không có embedding)
-        self.assertIn("hết quota embedding", meta["warning"])
-        self.assertIn("CLOUDFLARE_ACCOUNT_ID", meta["warning"])
-        self.assertNotIn("thêm GROQ_API_KEY", meta["warning"])
+        self.assertIn("Cloudflare đã hết quota embedding", meta["warning"])
+        self.assertIn("WEB_EMBEDDING_PROVIDER=none", meta["warning"])
         result = self.ask("Xe tuần tra hết nhiên liệu thì phải làm gì?")[-1]
         self.assertEqual(result["type"], "result")
         self.assertTrue(result["sources"])
@@ -425,11 +423,11 @@ class TestProviders(unittest.TestCase):
                     raise self.error
                 return f"từ {self.name}"
 
-        llm = FallbackLLM([("gemini", Provider("gemini", ProviderError("gemini", 429, "quota"))),
-                           ("groq", Provider("groq"))])
-        self.assertEqual(llm.generate("hỏi"), "từ groq")
-        self.assertEqual(llm.generate("hỏi lần 2"), "từ groq")
-        self.assertEqual(calls, ["gemini", "groq", "groq"])  # gemini đang nghỉ nên được thử sau
+        llm = FallbackLLM([("gpt-oss-120b", Provider("gpt-oss-120b", ProviderError("groq", 429, "quota"))),
+                           ("llama-70b", Provider("llama-70b"))])
+        self.assertEqual(llm.generate("hỏi"), "từ llama-70b")
+        self.assertEqual(llm.generate("hỏi lần 2"), "từ llama-70b")
+        self.assertEqual(calls, ["gpt-oss-120b", "llama-70b", "llama-70b"])  # model hết quota đang nghỉ nên được thử sau
 
         broken = FallbackLLM([("a", Provider("a", ProviderError("a", 500, "x"))),
                               ("b", Provider("b", ProviderError("b", 429, "y")))])
@@ -466,22 +464,39 @@ class TestProviders(unittest.TestCase):
             limited.generate("hỏi")
         self.assertEqual(caught.exception.code, 429)
 
-    def test_create_llm_from_environment(self):
+    def test_create_llm_groq_only(self):
         from unittest import mock
-        base = {k: v for k, v in os.environ.items()
-                if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "LLM_PROVIDERS")
-                and not k.startswith("OPENAI_COMPAT_")}
+        base = {k: v for k, v in os.environ.items() if k not in ("GROQ_API_KEY", "GROQ_MODELS")}
 
         with mock.patch.dict(os.environ, base, clear=True):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as caught:
                 create_llm()
+            self.assertIn("GROQ_API_KEY", str(caught.exception))
+
         with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g"), clear=True):
-            self.assertEqual(describe_llm(create_llm()), ["groq/openai/gpt-oss-120b"])
-        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g", GEMINI_API_KEY="x"), clear=True):
-            self.assertEqual(describe_llm(create_llm(gemini_model="gemini-x")), ["gemini/gemini-x", "groq/openai/gpt-oss-120b"])
-        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g", GEMINI_API_KEY="x", LLM_PROVIDERS="groq,gemini",
-                                              GROQ_MODEL="llama-3.3-70b-versatile"), clear=True):
-            self.assertEqual(describe_llm(create_llm(gemini_model="gemini-x"))[0], "groq/llama-3.3-70b-versatile")
+            # Mặc định: nhiều model Groq dự phòng cho nhau (hạn mức tính riêng từng model)
+            self.assertEqual(describe_llm(create_llm()), [
+                "groq/openai/gpt-oss-120b", "groq/llama-3.3-70b-versatile",
+                "groq/openai/gpt-oss-20b", "groq/llama-3.1-8b-instant",
+            ])
+            self.assertEqual(describe_llm(create_llm(models="llama-3.3-70b-versatile")), ["groq/llama-3.3-70b-versatile"])
+
+        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g", GROQ_MODELS=" a , b, a ,"), clear=True):
+            self.assertEqual(describe_llm(create_llm()), ["groq/a", "groq/b"])
+
+    def test_rate_limit_rest_uses_retry_after(self):
+        client = OpenAICompatibleClient("groq", "https://x/v1", "k", "m1", http_client=mock_http(
+            lambda request: httpx.Response(429, headers={"retry-after": "7"}, text="rate limit")))
+        with self.assertRaises(ProviderError) as caught:
+            client.generate("hỏi")
+        self.assertEqual(caught.exception.retry_after, 7.0)
+
+        backup = OpenAICompatibleClient("groq", "https://x/v1", "k", "m2", http_client=mock_http(
+            lambda request: httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})))
+        llm = FallbackLLM([("groq/m1", client), ("groq/m2", backup)], cooldown_seconds=999)
+        self.assertEqual(llm.generate("hỏi"), "ok")
+        rest = llm._resting_until["groq/m1"] - time.time()
+        self.assertTrue(5 < rest <= 7.5)
 
     def test_cloudflare_embedder(self):
         seen = []
@@ -507,17 +522,14 @@ class TestProviders(unittest.TestCase):
 
     def test_create_embedder_selection(self):
         from unittest import mock
-        base = {k: v for k, v in os.environ.items()
-                if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")}
+        base = {k: v for k, v in os.environ.items() if k not in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")}
         with mock.patch.dict(os.environ, base, clear=True):
-            self.assertIsNone(create_embedder("auto", "gemini-embedding-2", 768))
-        with mock.patch.dict(os.environ, dict(base, GEMINI_API_KEY="x"), clear=True):
-            self.assertIsInstance(create_embedder("auto", "gemini-embedding-2", 768), GeminiEmbedder)
-            self.assertIsNone(create_embedder("none", "gemini-embedding-2", 768))
-        with mock.patch.dict(os.environ, dict(base, GEMINI_API_KEY="x", CLOUDFLARE_ACCOUNT_ID="a",
-                                              CLOUDFLARE_API_TOKEN="t"), clear=True):
-            self.assertIsInstance(create_embedder("auto", "gemini-embedding-2", 768), CloudflareEmbedder)
-            self.assertIsInstance(create_embedder("gemini", "gemini-embedding-2", 768), GeminiEmbedder)
+            self.assertIsNone(create_embedder("auto"))  # không có Cloudflare -> chỉ tìm từ khoá
+            with self.assertRaises(ValueError):
+                create_embedder("cloudflare")
+        with mock.patch.dict(os.environ, dict(base, CLOUDFLARE_ACCOUNT_ID="a", CLOUDFLARE_API_TOKEN="t"), clear=True):
+            self.assertIsInstance(create_embedder("auto"), CloudflareEmbedder)
+            self.assertIsNone(create_embedder("none"))
 
 
 class TestStorageSelection(unittest.TestCase):
@@ -546,42 +558,13 @@ class TestStorageSelection(unittest.TestCase):
                 self.assertIsInstance(create_storage(settings), BlobStorage)
 
 
-class TestGeminiEmbedder(unittest.TestCase):
+class TestHistoryPrompt(unittest.TestCase):
 
-    def make(self, model, aggregate=False):
-        embedder = GeminiEmbedder(model=model, dimensions=4, api_key="khong-goi-mang")
-        calls = []
-
-        def embed_content(model, contents, config):
-            calls.append({"contents": contents, "config": config})
-            items = contents if isinstance(contents, list) else [contents]
-            count = 1 if aggregate and isinstance(contents, list) else len(items)
-            return SimpleNamespace(embeddings=[SimpleNamespace(values=[3.0, 4.0, 0.0, 0.0]) for _ in range(count)])
-
-        embedder._client = SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
-        return embedder, calls
-
-    def test_prefix_format_and_normalization(self):
-        embedder, calls = self.make("gemini-embedding-2")
-        vectors = embedder.embed_documents(["nội dung A", "nội dung B"], title="De thi")
-        self.assertEqual(vectors.shape, (2, 4))
-        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, rtol=1e-6)
-        self.assertEqual(calls[0]["contents"][0].parts[0].text, "title: De thi | text: nội dung A")
-        self.assertIsNone(calls[0]["config"].task_type)
-
-        embedder.embed_queries(["câu hỏi"])
-        self.assertEqual(calls[1]["contents"][0].parts[0].text, "task: search result | query: câu hỏi")
-
-    def test_task_type_for_embedding_001_and_aggregate_fallback(self):
-        embedder, calls = self.make("gemini-embedding-001")
-        embedder.embed_queries(["q"])
-        self.assertEqual(calls[0]["config"].task_type, "RETRIEVAL_QUERY")
-        self.assertEqual(calls[0]["contents"][0].parts[0].text, "q")
-
-        embedder, calls = self.make("gemini-embedding-2", aggregate=True)
-        vectors = embedder.embed_documents(["a", "b", "c"])
-        self.assertEqual(vectors.shape, (3, 4))
-        self.assertEqual(len(calls), 1 + 3)  # 1 lần gộp + gọi lại từng đoạn
+    def test_long_history_is_clipped(self):
+        from RAG.reasoning import format_history
+        text = format_history([("hỏi " * 10, "trả lời rất dài " * 200)], max_chars=100)
+        self.assertLess(len(text), 300)
+        self.assertTrue(text.endswith("…"))
 
 
 if __name__ == "__main__":

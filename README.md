@@ -8,7 +8,8 @@ Project có hai cách dùng:
 |---|---|---|
 | Giao diện | Chat kiểu ChatGPT, upload PDF ngay trong khung chat | Terminal |
 | Tài liệu | PDF người dùng tải lên, riêng cho từng cuộc trò chuyện | Thư mục `dataset/` (đề thi PROCON) |
-| Embedding | Gemini API (`gemini-embedding-2`) | `BAAI/bge-m3` chạy trên máy + reranker `bge-reranker-v2-m3` |
+| Trả lời (LLM) | Groq (nhiều model dự phòng cho nhau) | Groq |
+| Tìm kiếm | Từ khoá BM25 (+ embedding `bge-m3` qua Cloudflare nếu cấu hình) | `BAAI/bge-m3` chạy trên máy + reranker `bge-reranker-v2-m3` |
 | Lưu trữ | `dataset_web/` trên máy, Vercel Blob khi deploy | FAISS index trong `RAG_system/faiss_index/` |
 | Deploy | Vercel | Chạy trên máy |
 
@@ -18,9 +19,9 @@ Cả hai dùng chung lõi suy luận trong `RAG_system/RAG/reasoning.py`:
 Câu hỏi
   │ 1. Phân tích câu hỏi: phân loại, viết lại câu hỏi nối tiếp, tách truy vấn con
   ▼
-  │ 2. Tìm các đoạn liên quan (embedding + cosine / FAISS + rerank)
+  │ 2. Tìm các đoạn liên quan (web: BM25 + embedding; dòng lệnh: FAISS + rerank)
   ▼
-  │ 3. Suy luận (Gemini, thinking): bằng chứng nguyên văn -> các bước suy luận -> kết luận có trích dẫn [n]
+  │ 3. Suy luận (Groq, reasoning_effort): bằng chứng nguyên văn -> các bước suy luận -> kết luận có trích dẫn [n]
   ▼
   │ 4. Kiểm chứng: trích dẫn có thật sự nằm trong tài liệu không -> độ tin cậy + cảnh báo
   ▼
@@ -34,7 +35,7 @@ Câu trả lời
 ### Tính năng
 
 - Giao diện chat giống ChatGPT, có thanh bên chứa các cuộc trò chuyện, chế độ sáng / tối, dùng tốt trên điện thoại.
-- Bấm 📎 hoặc kéo thả PDF vào khung chat. Hệ thống đọc file, chia đoạn và tạo embedding; xong là hỏi được ngay. Có thể gõ câu hỏi trong lúc file đang xử lý, câu hỏi sẽ tự gửi khi file sẵn sàng.
+- Bấm 📎 hoặc kéo thả PDF vào khung chat. Hệ thống đọc file, chia đoạn (và tạo embedding nếu có Cloudflare); xong là hỏi được ngay. Có thể gõ câu hỏi trong lúc file đang xử lý, câu hỏi sẽ tự gửi khi file sẵn sàng.
 - Sau khi upload, bot tóm tắt tài liệu và gợi ý 3 câu hỏi (bấm vào để hỏi luôn).
 - **Thời gian phản hồi realtime:** đồng hồ chạy theo từng 0,1 giây trong lúc chờ, kèm thời gian của từng bước (phân tích câu hỏi → tìm đoạn liên quan → suy luận & kiểm chứng). Khi xong, câu trả lời hiện tổng thời gian; khối suy luận có bảng thời gian từng bước do server đo, cộng thêm phần mạng & hiển thị.
 - Khối "Đã suy luận trong N giây" (mở ra để xem): câu hỏi được hiểu thế nào, truy vấn tìm kiếm, các bước suy luận, bằng chứng ✓ / ✗, thời gian xử lý.
@@ -51,7 +52,7 @@ Câu trả lời
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env      # rồi điền GEMINI_API_KEY
+Copy-Item .env.example .env      # rồi điền GROQ_API_KEY
 uvicorn app:app --reload
 ```
 
@@ -61,30 +62,28 @@ Mở http://127.0.0.1:8000. File upload được lưu trong thư mục `dataset_
 
 1. Vào https://vercel.com/new, chọn **Import Git Repository**, chọn repo này. File `vercel.json` khai báo `"framework": "fastapi"`, nên Vercel deploy `app.py` như một app FastAPI duy nhất và cài `requirements.txt` ở gốc. Nhờ vậy Vercel không nhầm thư mục `RAG_system/` là một service riêng. Kiểm tra mục Framework Preset hiện **FastAPI**, rồi bấm **Deploy**.
 2. Trong project trên Vercel, mở tab **Storage**, tạo một **Blob** store, chọn chế độ **Private** rồi bấm **Connect** với project. Vercel sẽ tự thêm thông tin đăng nhập Blob vào project.
-3. Mở **Settings → Environment Variables** và thêm `GEMINI_API_KEY`. Có thể thêm các biến tuỳ chọn ở mục 3.
+3. Mở **Settings → Environment Variables**, thêm biến **Key** `GROQ_API_KEY` với **Value** là key lấy ở https://console.groq.com/keys, rồi bấm **Save**. Có thể thêm các biến tuỳ chọn ở mục 3, mỗi biến một dòng Key / Value.
 4. Mở **Deployments**, chọn **Redeploy** để áp dụng biến môi trường.
 5. Mở trang web. Góc dưới thanh bên sẽ hiện "Lưu trữ: Vercel Blob". Nếu chưa kết nối Blob hoặc thiếu API key, trang sẽ hiện thông báo màu vàng hướng dẫn cách sửa.
 
 Nếu bạn tạo Blob store ở chế độ **Public**, cần đặt thêm biến `BLOB_ACCESS=public`.
 
-### Dùng miễn phí được nhiều hơn (tránh hết quota)
+### LLM và tìm kiếm (miễn phí)
 
-Free tier của Gemini khá hẹp, nhất là với model Flash mới. App hỗ trợ ghép nhiều nhà cung cấp miễn phí:
-
-| Việc | Nhà cung cấp | Biến môi trường | Ghi chú |
+| Việc | Dùng gì | Biến môi trường | Ghi chú |
 |---|---|---|---|
-| Tìm kiếm | Không cần gì | — | Tìm từ khoá BM25 luôn chạy trên server, không tốn quota. Upload không bao giờ lỗi vì hết quota embedding. |
-| Embedding | Cloudflare Workers AI (`@cf/baai/bge-m3`) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Free tier tính theo "neuron"/ngày, đủ cho hàng triệu token. Cùng model với bản dòng lệnh. |
-| Embedding | Gemini (`gemini-embedding-2`) | `GEMINI_API_KEY` | Dùng khi không có Cloudflare. |
-| Trả lời | Gemini | `GEMINI_API_KEY` | Chất lượng tốt, quota thấp. |
-| Trả lời | **Groq** (`openai/gpt-oss-120b`) | `GROQ_API_KEY` | Free tier rộng hơn nhiều (xem số liệu trong trang Limits của Groq). Lưu ý: là **Groq**, không phải **Grok** của xAI (Grok không có free tier). |
-| Trả lời | OpenRouter / API tương thích OpenAI | `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_API_KEY`, `OPENAI_COMPAT_MODEL` | Dự phòng thêm. |
+| Trả lời | **Groq** | `GROQ_API_KEY` (bắt buộc) | Là **Groq** (chữ q), không phải **Grok** của xAI. |
+| Tìm kiếm từ khoá | BM25 trên server | — | Luôn chạy, không tốn quota. Upload không bao giờ lỗi vì hết quota. |
+| Tìm kiếm ngữ nghĩa | Cloudflare Workers AI (`@cf/baai/bge-m3`) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (tuỳ chọn) | Free tier tính theo "neuron"/ngày. Cùng model với bản dòng lệnh. |
 
-- Khi có nhiều nhà cung cấp LLM, app thử lần lượt theo `LLM_PROVIDERS` (mặc định `gemini,groq,openai`). Bên nào hết quota thì app tự chuyển sang bên kế tiếp, và bên đó được "nghỉ" 60 giây trước khi thử lại.
-- Muốn tiết kiệm quota Gemini: đặt `LLM_PROVIDERS=groq,gemini`.
-- Lấy key Cloudflare: vào dash.cloudflare.com, copy **Account ID**. Sau đó vào **My Profile → API Tokens**, tạo token có quyền **Workers AI** (Read).
-- **Groq / OpenRouter không có dịch vụ embedding.** Thêm `GROQ_API_KEY` chỉ giúp phần trả lời. Muốn hết lỗi quota ở bước embedding, thêm Cloudflare hoặc đặt `WEB_EMBEDDING_PROVIDER=none` để chỉ tìm từ khoá.
-- Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng tìm kiếm từ khoá. Khi embedding dùng được trở lại (ví dụ vừa thêm Cloudflare), tài liệu đó **tự được bổ sung embedding ở lần hỏi kế tiếp**, không cần upload lại. Nếu lần thử bổ sung lại hết quota, app tạm ngừng thử 15 phút.
+**Nhiều model Groq dự phòng cho nhau.** Groq tính hạn mức **riêng cho từng model** (ví dụ `gpt-oss-120b`: 30 request/phút, 1.000 request/ngày, 8.000 token/phút). App dùng lần lượt `GROQ_MODELS` (mặc định `openai/gpt-oss-120b, llama-3.3-70b-versatile, openai/gpt-oss-20b, llama-3.1-8b-instant`). Model nào hết quota thì app tự chuyển sang model kế tiếp; model đó được "nghỉ" theo thời gian Groq báo trong header `retry-after`. Hạn mức theo ngày của Groq đặt lại lúc 0h UTC (7h sáng giờ Việt Nam).
+
+**Tìm kiếm:**
+- Không cấu hình Cloudflare thì app chỉ tìm theo từ khoá, vẫn dùng bình thường.
+- Lấy thông tin Cloudflare:
+  - **Account ID:** bấm **Search** (hoặc `Ctrl+K`) trong dashboard, gõ `Copy account ID` rồi chọn kết quả. Hoặc vào **Workers & Pages**, xem mục **Account Details**.
+  - **API Token:** vào **My Profile → API Tokens**, tạo token có quyền **Workers AI**.
+- Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng từ khoá. Khi embedding dùng được trở lại, tài liệu **tự được bổ sung embedding ở lần hỏi kế tiếp**, không cần upload lại. Nếu lại hết quota, app tạm ngừng thử 15 phút.
 - Embedding câu hỏi lỗi lúc hỏi: app tự dùng tìm kiếm từ khoá và ghi chú điều đó trong câu trả lời.
 
 ### Dữ liệu được lưu như thế nào
@@ -108,7 +107,7 @@ Lịch sử chat lưu trong trình duyệt (localStorage). Xoá một cuộc tr�
 - **Tối đa 10 PDF** cho mỗi cuộc trò chuyện.
 - **PDF scan dạng ảnh** (không có lớp chữ) sẽ bị từ chối; cần OCR trước khi tải lên.
 - **Mỗi request chạy tối đa 300 giây** ở gói Hobby của Vercel, đủ cho tài liệu vài trăm trang.
-- **Web để công khai:** ai có link cũng upload được file và dùng quota Gemini của bạn. Nếu cần hạn chế, bật **Deployment Protection** trong Settings của Vercel.
+- **Web để công khai:** ai có link cũng upload được file và dùng quota Groq của bạn. Nếu cần hạn chế, bật **Deployment Protection** trong Settings của Vercel.
 
 ---
 
@@ -140,21 +139,18 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
-| `GEMINI_API_KEY` / `GROQ_API_KEY` | (cần ít nhất một) | API key LLM: Gemini (https://aistudio.google.com/apikey), Groq (https://console.groq.com/keys) |
-| `LLM_PROVIDERS` | `gemini,groq,openai` | Thứ tự thử các nhà cung cấp LLM khi một bên hết quota |
-| `WEB_EMBEDDING_PROVIDER` | `auto` | `auto` / `cloudflare` / `gemini` / `none` (chỉ tìm từ khoá) |
+| `GROQ_API_KEY` | (bắt buộc) | API key Groq, lấy tại https://console.groq.com/keys |
+| `GROQ_MODELS` | `openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b,llama-3.1-8b-instant` | Các model theo thứ tự ưu tiên; hết quota model đầu thì dùng model sau |
+| `GROQ_REASONING_EFFORT` | `medium` | Mức suy luận của các model gpt-oss: `low`, `medium`, `high`, `off` |
+| `WEB_EMBEDDING_PROVIDER` | `auto` | `auto` (Cloudflare nếu có key) / `cloudflare` / `none` (chỉ tìm từ khoá) |
 | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | (tuỳ chọn) | Embedding `bge-m3` qua Cloudflare Workers AI |
-| `GEMINI_MODEL` | `gemini-3.5-flash` | Model trả lời |
-| `GEMINI_THINKING_LEVEL` | `medium` | Mức suy luận: `minimal`, `low`, `medium`, `high`, `off` |
-| `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Model embedding của bản web |
-| `GEMINI_EMBEDDING_DIMENSIONS` | `768` | Số chiều vector của bản web |
 | `BLOB_ACCESS` | `private` | Chế độ của Vercel Blob store |
 | `MAX_UPLOAD_MB` | `4` | Dung lượng tối đa mỗi PDF |
-| `WEB_CHUNK_SIZE` / `WEB_CHUNK_OVERLAP` / `WEB_TOP_N` | `800` / `150` / `6` | Chia đoạn và số đoạn đưa cho Gemini (bản web) |
+| `WEB_CHUNK_SIZE` / `WEB_CHUNK_OVERLAP` / `WEB_TOP_N` | `800` / `150` / `6` | Chia đoạn và số đoạn đưa cho LLM (bản web) |
 | `EMBEDDING_MODEL` / `RERANKER_MODEL` | `BAAI/bge-m3` / `BAAI/bge-reranker-v2-m3` | Model của bản dòng lệnh |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_INITIAL_K` / `RAG_TOP_N` | `500` / `100` / `10` / `5` | Tham số của bản dòng lệnh |
 
-Đổi model embedding hoặc số chiều vector của bản web thì các PDF đã upload trước đó phải tải lại.
+Đổi model embedding thì các PDF đã upload sẽ tự được tạo lại embedding ở lần hỏi kế tiếp.
 
 ---
 
@@ -166,7 +162,7 @@ Mã nguồn: `RAG_system/RAG/reasoning.py`. Prompt: `RAG_system/config_prompt_we
    - Câu chào hỏi hoặc câu ngoài phạm vi được trả lời ngay, không tìm kiếm.
    - Câu hỏi nối tiếp được viết lại thành câu đầy đủ dựa trên 4 lượt hội thoại gần nhất.
    - Câu hỏi nhiều ý được tách thành tối đa 3 truy vấn con.
-2. **Trả lời có suy luận (`ReasoningAnswerer`):** Gemini bắt buộc trả JSON theo thứ tự `evidence` (trích nguyên văn) → `reasoning_steps` → `answerable` → `answer` (có trích dẫn [n]) → `confidence`.
+2. **Trả lời có suy luận (`ReasoningAnswerer`):** model bắt buộc trả JSON theo thứ tự `evidence` (trích nguyên văn) → `reasoning_steps` → `answerable` → `answer` (có trích dẫn [n]) → `confidence`.
    - Nếu tài liệu không đề cập, bot nói rõ là không có thay vì bịa.
 3. **Kiểm chứng (`GroundingChecker`):** so khớp từng trích dẫn với đoạn tài liệu được dẫn. Việc so khớp đã chuẩn hoá Unicode tiếng Việt và khoảng trắng, và cho phép lược bằng "...".
    - Trích dẫn bịa hoặc số [n] không tồn tại sẽ bị cảnh báo, và độ tin cậy bị hạ xuống.
@@ -185,10 +181,10 @@ python test_simple.py     # kiểm tra nhanh file PDF và cấu trúc project
 
 ## 6. Xử lý lỗi thường gặp
 
-- **Thanh vàng "Server chưa cấu hình GEMINI_API_KEY":** thêm biến môi trường rồi deploy lại (hoặc tạo `.env` khi chạy trên máy).
+- **Thanh vàng "Server chưa có GROQ_API_KEY":** thêm biến môi trường rồi Redeploy (hoặc tạo `.env` khi chạy trên máy).
 - **"Chưa kết nối Vercel Blob store":** làm bước 2 ở mục Deploy, rồi Redeploy.
-- **Lỗi 404 / model không tồn tại:** Google thường xuyên ngừng model cũ. Đổi `GEMINI_MODEL` / `GEMINI_EMBEDDING_MODEL` sang model đang được hỗ trợ (https://ai.google.dev/gemini-api/docs/models).
-- **"Đã vượt giới hạn gọi Gemini API":** hết quota hoặc gọi quá nhanh; chờ vài phút hoặc nâng gói.
+- **Lỗi 404 / model không tồn tại:** Groq thỉnh thoảng ngừng model cũ. Sửa `GROQ_MODELS` theo danh sách tại https://console.groq.com/docs/models.
+- **"Groq đã hết quota cho tất cả model":** chờ vài phút (giới hạn theo phút) hoặc tới 7h sáng hôm sau (giới hạn theo ngày).
 - **File quá 4 MB:** nén PDF hoặc tách thành nhiều file.
 
 ---
@@ -204,11 +200,11 @@ RAG_reasoning/
 ├── webapp/                         # Backend web
 │   ├── config.py                   # Cấu hình bản web
 │   ├── storage.py                  # Lưu trữ: thư mục dataset_web/ hoặc Vercel Blob
-│   ├── embeddings.py               # Embedding qua API: Cloudflare bge-m3 / Gemini
+│   ├── embeddings.py               # Embedding qua Cloudflare Workers AI (bge-m3)
 │   ├── keyword_search.py           # Tìm kiếm từ khoá BM25 (không tốn quota)
 │   └── service.py                  # Upload -> chunk -> embedding; hỏi–đáp có suy luận
 ├── RAG_system/
-│   ├── RAG/                        # Lõi RAG: reasoning, gen (Gemini), settings, pipeline / ingest / reranking (CLI)
+│   ├── RAG/                        # Lõi RAG: reasoning, gen (Groq), settings, pipeline / ingest / reranking (CLI)
 │   ├── read_file/                  # Đọc PDF, chia chunk
 │   ├── config_prompt_web.yaml      # Prompt bản web
 │   ├── config_prompt_system.yaml   # Prompt bản dòng lệnh

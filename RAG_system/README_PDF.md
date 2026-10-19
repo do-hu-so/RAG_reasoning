@@ -42,7 +42,7 @@ Các tham số hay dùng của `RAGPipeline`:
 | `use_query_analysis=False` | Bỏ bước phân tích câu hỏi |
 | `llm=...`, `vector_db=...`, `reranker=...` | Truyền thành phần có sẵn (ví dụ LLM giả khi test, xem `test_offline.py`) |
 
-Muốn dùng LLM khác Gemini: viết class có hàm `generate(prompt, system=None, json_schema=None, thinking_level=None) -> str` rồi truyền vào `llm=`.
+Muốn dùng LLM khác Groq: viết class có hàm `generate(prompt, system=None, json_schema=None, thinking_level=None) -> str` rồi truyền vào `llm=`.
 
 ---
 
@@ -106,10 +106,10 @@ context = get_information("câu hỏi", vector_db, reranker, initial_k=10, top_n
 ## 5. Từng bước reasoning
 
 ```python
-from RAG.gen import GeminiClient, load_prompts
+from RAG.gen import create_llm, load_prompts
 from RAG.reasoning import QueryAnalyzer, ReasoningAnswerer, GroundingChecker
 
-llm = GeminiClient()                      # model / thinking_level lấy từ .env
+llm = create_llm()                        # các model Groq trong GROQ_MODELS, key GROQ_API_KEY
 prompts = load_prompts()                  # RAG_system/config_prompt_system.yaml
 
 analysis = QueryAnalyzer(llm, prompts).analyze("còn xe tiếp nhiên liệu thì sao?",

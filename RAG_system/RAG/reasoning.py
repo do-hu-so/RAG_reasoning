@@ -139,13 +139,21 @@ def parse_json(text: str) -> Dict[str, Any]:
     return data
 
 
-def format_history(history: Sequence[Tuple[str, str]]) -> str:
+def format_history(history: Sequence[Tuple[str, str]], max_chars: int = 600) -> str:
     """
     Định dạng lịch sử hội thoại để đưa vào prompt.
+
+    Mỗi câu hỏi / câu trả lời chỉ giữ tối đa max_chars ký tự: đủ để hiểu câu hỏi
+    nối tiếp mà không tốn nhiều token (Groq free tier giới hạn token mỗi phút).
     """
     if not history:
         return "(chưa có)"
-    return "\n".join(f"Người dùng: {question}\nTrợ lý: {answer}" for question, answer in history)
+
+    def clip(text: str) -> str:
+        text = " ".join(str(text).split())
+        return text if len(text) <= max_chars else text[:max_chars].rstrip() + "…"
+
+    return "\n".join(f"Người dùng: {clip(question)}\nTrợ lý: {clip(answer)}" for question, answer in history)
 
 
 def describe_source(document: Document) -> str:

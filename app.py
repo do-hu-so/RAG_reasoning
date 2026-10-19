@@ -53,7 +53,7 @@ def handle_service_error(request, error: ServiceError) -> JSONResponse:
 def health() -> dict:
     settings = WebSettings()
     try:
-        llm_providers = describe_llm(create_llm(gemini_model=settings.llm_model))
+        llm_providers = describe_llm(create_llm(models=settings.llm_models))
     except ValueError:
         llm_providers = []
     status = {

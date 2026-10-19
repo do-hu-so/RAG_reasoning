@@ -28,8 +28,10 @@ DEFAULT_PROMPT_FILE = RAG_SYSTEM_DIR / "config_prompt_system.yaml"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
-# Model Gemini và mức suy luận (thinking_level: minimal | low | medium | high | off)
-DEFAULT_LLM_MODEL = "gemini-3.5-flash"
+# Các model Groq, theo thứ tự ưu tiên. Groq tính hạn mức riêng cho từng model, nên
+# model đầu hết quota thì tự chuyển sang model sau.
+DEFAULT_LLM_MODELS = "openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b,llama-3.1-8b-instant"
+# Mức suy luận (reasoning_effort của các model gpt-oss): low | medium | high | off
 DEFAULT_THINKING_LEVEL = "medium"
 DEFAULT_ANALYSIS_THINKING_LEVEL = "low"
 
@@ -58,8 +60,8 @@ class RAGSettings:
 
     embedding_model: str = field(default_factory=lambda: _env_str("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
     reranker_model: str = field(default_factory=lambda: _env_str("RERANKER_MODEL", DEFAULT_RERANKER_MODEL))
-    llm_model: str = field(default_factory=lambda: _env_str("GEMINI_MODEL", DEFAULT_LLM_MODEL))
-    thinking_level: str = field(default_factory=lambda: _env_str("GEMINI_THINKING_LEVEL", DEFAULT_THINKING_LEVEL))
+    llm_models: str = field(default_factory=lambda: _env_str("GROQ_MODELS", DEFAULT_LLM_MODELS))
+    thinking_level: str = field(default_factory=lambda: _env_str("GROQ_REASONING_EFFORT", DEFAULT_THINKING_LEVEL))
     analysis_thinking_level: str = DEFAULT_ANALYSIS_THINKING_LEVEL
 
     chunk_size: int = field(default_factory=lambda: _env_int("RAG_CHUNK_SIZE", 500))

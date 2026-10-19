@@ -1044,14 +1044,14 @@
       var data = await response.json();
       state.config = data;
       var storage = data.storage === "vercel-blob" ? "Vercel Blob" : data.storage === "local" ? "thư mục dataset_web/" : "chưa sẵn sàng";
-      var providers = (data.llm_providers || []).join(" → ") || "chưa cấu hình";
+      var providers = (data.llm_providers || []).map(function (name) { return name.replace(/^groq\//, ""); }).join(" → ") || "chưa cấu hình";
       var search = data.embedding_model ? "từ khoá + ngữ nghĩa (" + data.embedding_model + ")" : "từ khoá (BM25)";
       els.serverStatus.innerHTML =
         "<strong>Model:</strong> " + escapeHtml(providers) +
         "<br><strong>Tìm kiếm:</strong> " + escapeHtml(search) +
         "<br><strong>Lưu trữ:</strong> " + escapeHtml(storage);
       if (data.storage_error) showBanner(data.storage_error);
-      else if (!data.llm_configured) showBanner("Server chưa có API key cho LLM (GEMINI_API_KEY hoặc GROQ_API_KEY) nên chưa thể trả lời câu hỏi.");
+      else if (!data.llm_configured) showBanner("Server chưa có GROQ_API_KEY nên chưa thể trả lời câu hỏi. Thêm biến này trong Environment Variables rồi Redeploy.");
       if (!current()) renderMessages();
     } catch (err) {
       els.serverStatus.textContent = "Không kết nối được server.";

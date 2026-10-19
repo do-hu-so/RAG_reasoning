@@ -70,7 +70,7 @@ class RAGPipeline:
         """
         Args:
             settings: Cấu hình; mặc định đọc từ biến môi trường / .env
-            llm: LLM có hàm generate; mặc định GeminiClient
+            llm: LLM có hàm generate; mặc định các model Groq trong settings.llm_models
             vector_db: Vector database có sẵn; mặc định nạp (hoặc build) FAISS index
             reranker: Reranker có sẵn; mặc định tải model theo settings
             use_reranker: Tắt để chạy nhanh hơn trên máy yếu (chỉ dùng vector search)
@@ -80,9 +80,9 @@ class RAGPipeline:
         self.settings = settings or RAGSettings()
 
         # Khởi tạo LLM trước để báo lỗi thiếu API key ngay, trước khi tải các model lớn
-        # Gemini / Groq / API tương thích OpenAI, tự chuyển khi một bên hết quota
+        # Các model Groq, tự chuyển sang model kế tiếp khi một model hết quota
         self.llm: LLMClient = llm or create_llm(
-            gemini_model=self.settings.llm_model,
+            models=self.settings.llm_models,
             thinking_level=self.settings.thinking_level,
         )
         self.prompts = prompts or load_prompts(self.settings.prompt_file)

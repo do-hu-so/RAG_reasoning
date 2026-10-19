@@ -13,7 +13,7 @@ from pathlib import Path
 
 from RAG.settings import (
     DEFAULT_ANALYSIS_THINKING_LEVEL,
-    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_MODELS,
     DEFAULT_THINKING_LEVEL,
     PROJECT_ROOT,
     RAG_SYSTEM_DIR,
@@ -25,7 +25,7 @@ WEB_PROMPT_FILE = RAG_SYSTEM_DIR / "config_prompt_web.yaml"
 DATASET_WEB_NAME = "dataset_web"
 LOCAL_DATASET_DIR = PROJECT_ROOT / DATASET_WEB_NAME
 
-DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
+DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3"
 
 
 def _env_str(name: str, default: str) -> str:
@@ -43,14 +43,14 @@ class WebSettings:
     Cấu hình của bản web.
     """
 
-    llm_model: str = field(default_factory=lambda: _env_str("GEMINI_MODEL", DEFAULT_LLM_MODEL))
-    thinking_level: str = field(default_factory=lambda: _env_str("GEMINI_THINKING_LEVEL", DEFAULT_THINKING_LEVEL))
+    # Các model Groq theo thứ tự ưu tiên (hết quota model đầu thì dùng model sau)
+    llm_models: str = field(default_factory=lambda: _env_str("GROQ_MODELS", DEFAULT_LLM_MODELS))
+    thinking_level: str = field(default_factory=lambda: _env_str("GROQ_REASONING_EFFORT", DEFAULT_THINKING_LEVEL))
     analysis_thinking_level: str = DEFAULT_ANALYSIS_THINKING_LEVEL
 
-    # auto: Cloudflare (nếu có key) -> Gemini (nếu có key) -> chỉ tìm từ khoá; hoặc cloudflare | gemini | none
+    # auto: Cloudflare nếu có key, không thì chỉ tìm từ khoá; hoặc cloudflare | none
     embedding_provider: str = field(default_factory=lambda: _env_str("WEB_EMBEDDING_PROVIDER", "auto"))
-    embedding_model: str = field(default_factory=lambda: _env_str("GEMINI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
-    embedding_dimensions: int = field(default_factory=lambda: _env_int("GEMINI_EMBEDDING_DIMENSIONS", 768))
+    embedding_model: str = field(default_factory=lambda: _env_str("CLOUDFLARE_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
 
     prompt_file: Path = WEB_PROMPT_FILE
     local_dataset_dir: Path = LOCAL_DATASET_DIR
