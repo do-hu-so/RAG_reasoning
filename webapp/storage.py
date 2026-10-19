@@ -128,20 +128,30 @@ class BlobStorage:
             self._blob.delete_blob(pathnames[start:start + 1000])
 
 
+# Các biến mà SDK Vercel Blob dùng để xác thực (OIDC + store id, hoặc token đọc–ghi)
+BLOB_CREDENTIAL_VARS = ("BLOB_STORE_ID", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN")
+
+
 def create_storage(settings: WebSettings) -> Storage:
     """
     Chọn nơi lưu trữ theo môi trường.
 
     Raises:
-        RuntimeError: Khi chạy trên Vercel mà chưa kết nối Blob store
+        RuntimeError: Khi chạy trên Vercel mà bản deploy chưa có thông tin Blob store
     """
-    if os.getenv("BLOB_READ_WRITE_TOKEN") or os.getenv("BLOB_STORE_ID"):
+    if any(os.getenv(name) for name in BLOB_CREDENTIAL_VARS):
         return BlobStorage(access=settings.blob_access)
 
     if os.getenv("VERCEL"):
+        environment = os.getenv("VERCEL_ENV", "không rõ")
+        # Chỉ liệt kê TÊN biến (không lộ giá trị) để dễ chẩn đoán
+        related = sorted(name for name in os.environ if "BLOB" in name.upper())
+        seen = f" Biến liên quan đến Blob đang có: {', '.join(related)}." if related else ""
         raise RuntimeError(
-            "Chưa kết nối Vercel Blob store với project. Vào tab Storage trên Vercel, "
-            "tạo Blob store, bấm Connect với project này rồi deploy lại."
+            f"Bản deploy này (môi trường {environment}) chưa có thông tin Vercel Blob (BLOB_STORE_ID). "
+            "Nếu bạn đã Connect Blob store: biến môi trường chỉ áp dụng cho bản deploy mới, hãy vào "
+            f"Deployments và bấm Redeploy; đồng thời kiểm tra store đã được Connect cho môi trường {environment}. "
+            "Nếu chưa có store: vào tab Storage, tạo Blob store rồi Connect với project này." + seen
         )
 
     return LocalStorage(settings.local_dataset_dir)

@@ -15,6 +15,7 @@ Version: 1.0.0
 
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -286,6 +287,32 @@ class TestAppShell(WebTestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("RAG Reasoning", page.text)
         self.assertEqual(self.client.get("/assets/app.js").status_code, 200)
+
+
+class TestStorageSelection(unittest.TestCase):
+
+    def test_choose_storage_by_environment(self):
+        from unittest import mock
+        from webapp.storage import BlobStorage, create_storage
+
+        clean = {k: v for k, v in os.environ.items() if "BLOB" not in k.upper() and k not in ("VERCEL", "VERCEL_ENV")}
+        settings = WebSettings(local_dataset_dir=Path(tempfile.mkdtemp()))
+
+        with mock.patch.dict(os.environ, clean, clear=True):
+            self.assertIsInstance(create_storage(settings), LocalStorage)
+
+        with mock.patch.dict(os.environ, dict(clean, VERCEL="1", VERCEL_ENV="production", BLOB_WEBHOOK_PUBLIC_KEY="x"), clear=True):
+            with self.assertRaises(RuntimeError) as caught:
+                create_storage(settings)
+            message = str(caught.exception)
+            self.assertIn("production", message)
+            self.assertIn("Redeploy", message)
+            self.assertIn("BLOB_WEBHOOK_PUBLIC_KEY", message)  # chỉ tên biến
+            self.assertNotIn("=x", message)
+
+        for name in ("BLOB_STORE_ID", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN"):
+            with mock.patch.dict(os.environ, dict(clean, VERCEL="1", **{name: "store_abc"}), clear=True):
+                self.assertIsInstance(create_storage(settings), BlobStorage)
 
 
 class TestGeminiEmbedder(unittest.TestCase):
