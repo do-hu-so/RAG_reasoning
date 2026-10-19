@@ -59,7 +59,7 @@ Mở http://127.0.0.1:8000. File upload được lưu trong thư mục `dataset_
 
 ### Deploy lên Vercel
 
-1. Vào https://vercel.com/new, chọn **Import Git Repository**, chọn repo này. Vercel tự nhận FastAPI qua `app.py` và cài `requirements.txt`. Bấm **Deploy**.
+1. Vào https://vercel.com/new, chọn **Import Git Repository**, chọn repo này. File `vercel.json` khai báo `"framework": "fastapi"`, nên Vercel deploy `app.py` như một app FastAPI duy nhất và cài `requirements.txt` ở gốc. Nhờ vậy Vercel không nhầm thư mục `RAG_system/` là một service riêng. Kiểm tra mục Framework Preset hiện **FastAPI**, rồi bấm **Deploy**.
 2. Trong project trên Vercel, mở tab **Storage**, tạo một **Blob** store, chọn chế độ **Private** rồi bấm **Connect** với project. Vercel sẽ tự thêm thông tin đăng nhập Blob vào project.
 3. Mở **Settings → Environment Variables** và thêm `GEMINI_API_KEY`. Có thể thêm các biến tuỳ chọn ở mục 3.
 4. Mở **Deployments**, chọn **Redeploy** để áp dụng biến môi trường.
