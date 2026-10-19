@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
@@ -87,6 +88,36 @@ class StoredDocument:
     meta: Dict[str, Any]
     chunks: List[Dict[str, Any]]
     vectors: np.ndarray
+
+
+class StageTimer:
+    """
+    Đo thời gian từng bước xử lý của một câu hỏi (giây).
+    """
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter()
+        self.timings: Dict[str, float] = {}
+        self._stage: Optional[str] = None
+        self._stage_started = self.started
+
+    def elapsed(self) -> float:
+        return round(time.perf_counter() - self.started, 3)
+
+    def start(self, stage: str) -> None:
+        self._close()
+        self._stage = stage
+        self._stage_started = time.perf_counter()
+
+    def finish(self) -> Dict[str, float]:
+        self._close()
+        self.timings["total"] = self.elapsed()
+        return dict(self.timings)
+
+    def _close(self) -> None:
+        if self._stage:
+            self.timings[self._stage] = round(time.perf_counter() - self._stage_started, 3)
+            self._stage = None
 
 
 def describe_error(error: Exception) -> str:
@@ -411,10 +442,12 @@ class WebRAGService:
         question: str,
         analysis: QueryAnalysis,
         result: ReasonedAnswer,
+        timings: Dict[str, float],
         hits: Sequence[Tuple[Document, float]] = (),
     ) -> Dict[str, Any]:
         return {
             "type": "result",
+            "timings": timings,
             "question": question,
             "category": analysis.category,
             "standalone_question": analysis.standalone_question,
@@ -432,6 +465,7 @@ class WebRAGService:
                     "filename": document.metadata["source"],
                     "label": describe_source(document),
                     "page_number": document.metadata["page_number"],
+                    "page_end": document.metadata["page_end"],
                     "score": round(score, 4),
                     "content": document.page_content,
                 }
@@ -447,39 +481,48 @@ class WebRAGService:
     ) -> Iterator[Dict[str, Any]]:
         """
         Trả lời câu hỏi, lần lượt sinh ra các sự kiện:
-        {"type": "status", ...} cho từng bước và cuối cùng {"type": "result", ...}.
+        {"type": "status", "elapsed": ...} khi bắt đầu mỗi bước và cuối cùng
+        {"type": "result", "timings": {...}, ...} kèm thời gian từng bước (giây).
         """
         self.check_conversation_id(conversation_id)
         question = question.strip()
         if not question:
             raise ServiceError(400, "Câu hỏi đang trống.")
 
+        timer = StageTimer()
+
+        def status(stage: str, message: str) -> Dict[str, Any]:
+            timer.start(stage)
+            return {"type": "status", "stage": stage, "message": message, "elapsed": timer.elapsed()}
+
         metas = self.list_documents(conversation_id)
         history = list(history)[-self.settings.history_turns:]
 
-        yield {"type": "status", "stage": "analyzing", "message": "Đang phân tích câu hỏi"}
+        yield status("analyzing", "Đang phân tích câu hỏi")
         analyzer = QueryAnalyzer(self.llm, self.prompts, thinking_level=self.settings.analysis_thinking_level)
         names = "\n".join(f"- {meta['filename']}" for meta in metas) or "(chưa có tài liệu nào)"
         analysis = analyzer.analyze(question, history, documents=names)
 
         if analysis.category != "document":
             reply = analysis.direct_reply or OUT_OF_SCOPE_MESSAGE
-            yield self._result_event(question, analysis, ReasonedAnswer(answer=reply, answerable=False, confidence="cao"))
+            answer = ReasonedAnswer(answer=reply, answerable=False, confidence="cao")
+            yield self._result_event(question, analysis, answer, timer.finish())
             return
 
         if not metas:
-            yield self._result_event(question, analysis, ReasonedAnswer(answer=NO_DOCUMENT_MESSAGE, answerable=False))
+            answer = ReasonedAnswer(answer=NO_DOCUMENT_MESSAGE, answerable=False)
+            yield self._result_event(question, analysis, answer, timer.finish())
             return
 
-        yield {"type": "status", "stage": "retrieving", "message": f"Đang tìm trong {len(metas)} tài liệu"}
+        yield status("retrieving", f"Đang tìm trong {len(metas)} tài liệu")
         documents = [self._load_document(meta, conversation_id) for meta in metas]
         hits = self._retrieve(documents, analysis.sub_queries or [analysis.standalone_question])
 
-        yield {"type": "status", "stage": "reasoning", "message": f"Đang suy luận trên {len(hits)} đoạn trích"}
+        yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
         answerer = ReasoningAnswerer(self.llm, self.prompts)
         result = answerer.answer(analysis.standalone_question, [document for document, _ in hits])
 
-        yield self._result_event(question, analysis, result, hits)
+        yield self._result_event(question, analysis, result, timer.finish(), hits)
 
 
 _service: Optional[WebRAGService] = None

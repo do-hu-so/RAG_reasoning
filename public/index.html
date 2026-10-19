@@ -90,6 +90,25 @@
       </div>
     </main>
 
+    <!-- Hộp trích dẫn văn bản gốc, hiển thị cạnh câu trả lời -->
+    <aside class="cite-panel" id="cite-panel" aria-label="Trích dẫn văn bản gốc" hidden>
+      <div class="cite-panel-head">
+        <div class="cite-panel-titles">
+          <h2>Trích dẫn văn bản gốc</h2>
+          <p class="cite-panel-question" id="cite-panel-question"></p>
+        </div>
+        <button class="icon-btn" id="close-cite" aria-label="Đóng hộp trích dẫn">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6 6.4 5Z"/></svg>
+        </button>
+      </div>
+      <div class="cite-panel-meta" id="cite-panel-meta"></div>
+      <div class="cite-panel-body" id="cite-panel-body"></div>
+      <p class="cite-panel-note">
+        <mark class="ev">Phần tô vàng</mark> là câu được trích nguyên văn làm bằng chứng.
+        Viền xanh: đoạn được dùng trong câu trả lời.
+      </p>
+    </aside>
+
     <!-- Panel tài liệu của cuộc trò chuyện -->
     <aside class="docs-panel" id="docs-panel" aria-label="Tài liệu" hidden>
       <div class="docs-panel-head">

@@ -36,9 +36,13 @@ Câu trả lời
 - Giao diện chat giống ChatGPT, có thanh bên chứa các cuộc trò chuyện, chế độ sáng / tối, dùng tốt trên điện thoại.
 - Bấm 📎 hoặc kéo thả PDF vào khung chat. Hệ thống đọc file, chia đoạn và tạo embedding; xong là hỏi được ngay. Có thể gõ câu hỏi trong lúc file đang xử lý, câu hỏi sẽ tự gửi khi file sẵn sàng.
 - Sau khi upload, bot tóm tắt tài liệu và gợi ý 3 câu hỏi (bấm vào để hỏi luôn).
-- Hiển thị tiến trình từng bước: phân tích câu hỏi → tìm trong tài liệu → suy luận.
-- Khối "Đã suy luận trong N giây" (mở ra để xem): câu hỏi được hiểu thế nào, truy vấn tìm kiếm, các bước suy luận, bằng chứng ✓ / ✗.
-- Chip trích dẫn `[n]` bấm được, mở ra đúng đoạn nguồn (tên file, trang, độ liên quan).
+- **Thời gian phản hồi realtime:** đồng hồ chạy theo từng 0,1 giây trong lúc chờ, kèm thời gian của từng bước (phân tích câu hỏi → tìm đoạn liên quan → suy luận & kiểm chứng). Khi xong, câu trả lời hiện tổng thời gian; khối suy luận có bảng thời gian từng bước do server đo, cộng thêm phần mạng & hiển thị.
+- Khối "Đã suy luận trong N giây" (mở ra để xem): câu hỏi được hiểu thế nào, truy vấn tìm kiếm, các bước suy luận, bằng chứng ✓ / ✗, thời gian xử lý.
+- **Hộp "Trích dẫn văn bản gốc" cạnh câu trả lời:**
+  - Màn hình rộng (≥ 1200px): hộp tự mở thành cột bên phải. Màn hình nhỏ: bấm "Văn bản gốc" để mở hộp nổi hoặc toàn màn hình.
+  - Hộp hiện nguyên văn từng đoạn nguồn và **tô vàng đúng câu được trích làm bằng chứng**; đoạn được câu trả lời dùng có viền xanh.
+  - Mỗi đoạn có nút mở PDF tại đúng trang.
+  - Bấm chip `[n]` trong câu trả lời hoặc chip nguồn bên dưới sẽ cuộn tới đoạn tương ứng.
 - Mỗi cuộc trò chuyện chỉ trả lời dựa trên các PDF đã tải lên trong cuộc trò chuyện đó. Panel "tài liệu" cho phép mở hoặc xoá từng file.
 
 ### Chạy trên máy

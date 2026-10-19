@@ -225,11 +225,18 @@ class TestAsk(WebTestCase):
         self.upload()
         events = self.ask("Xe tuần tra hết nhiên liệu thì phải làm gì?")
 
-        stages = [event["stage"] for event in events if event["type"] == "status"]
-        self.assertEqual(stages, ["analyzing", "retrieving", "reasoning"])
+        statuses = [event for event in events if event["type"] == "status"]
+        self.assertEqual([event["stage"] for event in statuses], ["analyzing", "retrieving", "reasoning"])
+        elapsed = [event["elapsed"] for event in statuses]
+        self.assertEqual(elapsed, sorted(elapsed))  # mốc thời gian tăng dần
 
         result = events[-1]
         self.assertEqual(result["type"], "result")
+        timings = result["timings"]
+        self.assertEqual(set(timings), {"analyzing", "retrieving", "reasoning", "total"})
+        self.assertGreaterEqual(timings["total"], timings["analyzing"] + timings["retrieving"] + timings["reasoning"] - 0.01)
+        self.assertGreaterEqual(timings["total"], elapsed[-1])
+        self.assertIsNotNone(result["sources"][0]["page_end"])
         self.assertEqual(result["category"], "document")
         self.assertLessEqual(len(result["sources"]), self.settings.top_n)
         self.assertTrue(result["evidence"][0]["verified"])
@@ -255,6 +262,7 @@ class TestAsk(WebTestCase):
         events = self.ask("Xin chào")
         self.assertEqual(events[-1]["answer"], "Xin chào!")
         self.assertEqual(events[-1]["sources"], [])
+        self.assertEqual(set(events[-1]["timings"]), {"analyzing", "total"})
         self.assertEqual(self.embedder.query_calls, 0)
 
     def test_errors_become_error_event(self):
