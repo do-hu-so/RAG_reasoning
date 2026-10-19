@@ -1,0 +1,12 @@
+pandas>=2.0,<3
+numpy>=1.24,<3
+pypdf>=5.0,<7
+faiss-cpu>=1.8,<2
+torch>=2.1
+sentence-transformers>=3.0,<7
+langchain-core>=1.0,<2
+langchain-community>=0.4,<0.5
+langchain-huggingface>=1.0,<2
+google-genai>=2.0,<3
+python-dotenv>=1.0
+PyYAML>=6.0

@@ -1,0 +1,9 @@
+# Không đưa lên Vercel: môi trường ảo, dữ liệu local, index và phần chỉ dùng cho bản dòng lệnh
+.venv
+venv
+.env
+dataset_web
+dataset
+RAG_system/faiss_index
+**/__pycache__
+test_*.py

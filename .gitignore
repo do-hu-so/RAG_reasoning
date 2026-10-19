@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RAG Reasoning
+# File upload khi chạy web trên máy (trên Vercel lưu ở Vercel Blob)
+dataset_web/
+# FAISS index của bản dòng lệnh (tự build lại)
+RAG_system/faiss_index/
+# Thư mục cấu hình Vercel CLI
+.vercel
