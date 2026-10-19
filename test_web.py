@@ -308,8 +308,10 @@ class FailingEmbedder(FakeEmbedder):
         super().__init__()
         self.fail_documents = fail_documents
         self.fail_queries = fail_queries
+        self.document_calls = 0
 
     def embed_documents(self, texts, title=None):
+        self.document_calls += 1
         if self.fail_documents:
             raise ProviderError("gemini", 429, "RESOURCE_EXHAUSTED")
         return super().embed_documents(texts, title)
@@ -352,10 +354,37 @@ class TestKeywordSearch(WebTestCase):
         self.assertEqual(response.status_code, 200)
         meta = response.json()
         self.assertEqual(meta["search"], "keyword")
-        self.assertIn("hết quota", meta["warning"])
+        # Gợi ý đúng cách xử lý: Cloudflare / tắt embedding, không phải Groq (Groq không có embedding)
+        self.assertIn("hết quota embedding", meta["warning"])
+        self.assertIn("CLOUDFLARE_ACCOUNT_ID", meta["warning"])
+        self.assertNotIn("thêm GROQ_API_KEY", meta["warning"])
         result = self.ask("Xe tuần tra hết nhiên liệu thì phải làm gì?")[-1]
         self.assertEqual(result["type"], "result")
         self.assertTrue(result["sources"])
+
+    def test_keyword_document_upgraded_when_embedding_available(self):
+        self.use_embedder(None)
+        meta = self.upload().json()
+        self.assertEqual(meta["search"], "keyword")
+
+        embedder = FakeEmbedder()
+        self.use_embedder(embedder)
+        result = self.ask("Xe tuần tra hết nhiên liệu thì phải làm gì?")[-1]
+        self.assertEqual(result["type"], "result")
+        self.assertEqual(embedder.query_calls, 1)  # đã dùng tìm kiếm ngữ nghĩa
+
+        upgraded = self.client.get(f"/api/conversations/{CONVERSATION}/documents").json()[0]
+        self.assertEqual((upgraded["search"], upgraded["embedding_model"], upgraded["warning"]),
+                         ("hybrid", "fake-embedding", None))
+        self.assertTrue((self.tmp / CONVERSATION / meta["id"] / "embeddings.npy").exists())
+
+    def test_embedding_rests_after_quota_error(self):
+        embedder = FailingEmbedder()
+        self.use_embedder(embedder)
+        self.upload()                                   # lần 1: upload
+        self.ask("Xe tuần tra hết nhiên liệu thì sao?")  # lần 2: thử bổ sung -> 429 -> tạm ngừng
+        self.ask("Đội thắng được xác định thế nào?")     # không thử lại trong thời gian nghỉ
+        self.assertEqual(embedder.document_calls, 2)
 
     def test_query_embedding_quota_falls_back_to_keywords(self):
         embedder = FailingEmbedder(fail_documents=False, fail_queries=True)
@@ -365,14 +394,16 @@ class TestKeywordSearch(WebTestCase):
         self.assertTrue(result["sources"])
         self.assertTrue(any("Tìm kiếm ngữ nghĩa tạm thời" in w for w in result["warnings"]))
 
-    def test_documents_from_other_embedding_model_use_keywords(self):
+    def test_documents_reembedded_with_current_model(self):
         self.upload()  # embedding bằng "fake-embedding"
         other = FakeEmbedder()
         other.model = "model-khac"
         self.use_embedder(other)
         result = self.ask("Xe tuần tra hết nhiên liệu thì phải làm gì?")[-1]
         self.assertEqual(result["type"], "result")
-        self.assertEqual(other.query_calls, 0)
+        listed = self.client.get(f"/api/conversations/{CONVERSATION}/documents").json()
+        self.assertEqual(listed[0]["embedding_model"], "model-khac")
+        self.assertEqual(other.query_calls, 1)
 
 
 def mock_http(handler):

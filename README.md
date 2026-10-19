@@ -83,7 +83,8 @@ Free tier của Gemini khá hẹp, nhất là với model Flash mới. App hỗ 
 - Khi có nhiều nhà cung cấp LLM, app thử lần lượt theo `LLM_PROVIDERS` (mặc định `gemini,groq,openai`). Bên nào hết quota thì app tự chuyển sang bên kế tiếp, và bên đó được "nghỉ" 60 giây trước khi thử lại.
 - Muốn tiết kiệm quota Gemini: đặt `LLM_PROVIDERS=groq,gemini`.
 - Lấy key Cloudflare: vào dash.cloudflare.com, copy **Account ID**. Sau đó vào **My Profile → API Tokens**, tạo token có quyền **Workers AI** (Read).
-- Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng tìm kiếm từ khoá.
+- **Groq / OpenRouter không có dịch vụ embedding.** Thêm `GROQ_API_KEY` chỉ giúp phần trả lời. Muốn hết lỗi quota ở bước embedding, thêm Cloudflare hoặc đặt `WEB_EMBEDDING_PROVIDER=none` để chỉ tìm từ khoá.
+- Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng tìm kiếm từ khoá. Khi embedding dùng được trở lại (ví dụ vừa thêm Cloudflare), tài liệu đó **tự được bổ sung embedding ở lần hỏi kế tiếp**, không cần upload lại. Nếu lần thử bổ sung lại hết quota, app tạm ngừng thử 15 phút.
 - Embedding câu hỏi lỗi lúc hỏi: app tự dùng tìm kiếm từ khoá và ghi chú điều đó trong câu trả lời.
 
 ### Dữ liệu được lưu như thế nào
@@ -175,7 +176,7 @@ Mã nguồn: `RAG_system/RAG/reasoning.py`. Prompt: `RAG_system/config_prompt_we
 ## 5. Kiểm thử
 
 ```powershell
-python test_web.py        # 23 test bản web: upload, hỏi–đáp stream, BM25 / hybrid, chuyển nhà cung cấp, lỗi (không cần API key)
+python test_web.py        # 25 test bản web: upload, hỏi–đáp stream, BM25 / hybrid, chuyển nhà cung cấp, lỗi (không cần API key)
 python test_offline.py    # 13 test lõi RAG + bản dòng lệnh (không cần API key / model)
 python test_simple.py     # kiểm tra nhanh file PDF và cấu trúc project
 ```

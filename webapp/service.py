@@ -14,6 +14,7 @@ Version: 1.0.0
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -27,7 +28,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 from langchain_core.documents import Document
 
-from RAG.gen import LLMClient, create_llm, fill_template, load_prompts
+from RAG.gen import LLMClient, create_llm, fill_template, is_rate_limit_error, load_prompts
 from RAG.reasoning import (
     QueryAnalysis,
     QueryAnalyzer,
@@ -58,6 +59,9 @@ CANDIDATES_PER_RANKING = 30
 
 # Giá trị mặc định của tham số embedder: tự chọn theo biến môi trường
 AUTO = object()
+
+# Embedding hết quota thì tạm ngừng thử bổ sung embedding cho tài liệu cũ (giây)
+EMBEDDING_REST_SECONDS = 15 * 60
 OVERVIEW_FILE = "overview.json"
 
 NO_DOCUMENT_MESSAGE = (
@@ -145,6 +149,8 @@ def describe_error(error: Exception) -> str:
     text = str(error)
     provider = getattr(error, "provider", None) or "Gemini"
     if code == 429 or "RESOURCE_EXHAUSTED" in text:
+        if os.getenv("GROQ_API_KEY"):
+            return f"{provider} đã hết quota / bị giới hạn tốc độ. Vui lòng thử lại sau ít phút."
         return (
             f"{provider} đã hết quota / bị giới hạn tốc độ. Vui lòng thử lại sau ít phút, "
             "hoặc thêm GROQ_API_KEY trên server để tự chuyển sang Groq khi một bên hết quota."
@@ -156,6 +162,24 @@ def describe_error(error: Exception) -> str:
     if code is not None and code >= 500:
         return f"Dịch vụ {provider} đang gặp sự cố tạm thời. Vui lòng thử lại."
     return f"Đã xảy ra lỗi: {text}"
+
+
+def describe_embedding_error(error: Exception) -> str:
+    """
+    Thông báo khi tạo embedding lỗi.
+
+    Groq / OpenRouter không có dịch vụ embedding, nên khi embedding hết quota phải
+    gợi ý Cloudflare (hoặc tắt embedding) chứ không phải thêm nhà cung cấp LLM.
+    """
+    code = getattr(error, "code", None)
+    provider = getattr(error, "provider", None) or "Gemini"
+    if code == 429 or "RESOURCE_EXHAUSTED" in str(error):
+        return (
+            f"{provider} đã hết quota embedding. Groq không có dịch vụ embedding nên không thay thế được; "
+            "thêm CLOUDFLARE_ACCOUNT_ID và CLOUDFLARE_API_TOKEN (embedding bge-m3 miễn phí) "
+            "hoặc đặt WEB_EMBEDDING_PROVIDER=none để chỉ dùng tìm kiếm từ khoá"
+        )
+    return describe_error(error).rstrip(".")
 
 
 def _now() -> str:
@@ -196,6 +220,7 @@ class WebRAGService:
         self.storage = storage
         self._embedder = None if embedder is AUTO else embedder
         self._embedder_ready = embedder is not AUTO
+        self._embedding_rest_until = 0.0
         self._llm = llm
         self.prompts = prompts or load_prompts(settings.prompt_file)
         self._cache: "OrderedDict[str, StoredDocument]" = OrderedDict()
@@ -319,7 +344,7 @@ class WebRAGService:
             except Exception as error:
                 logger.warning("Không tạo được embedding cho %s: %s", filename, error)
                 warning = (
-                    f"Chưa tạo được embedding ({describe_error(error)}). "
+                    f"Chưa tạo được embedding: {describe_embedding_error(error)}. "
                     "Tài liệu vẫn hỏi được bằng tìm kiếm từ khoá."
                 )
 
@@ -444,6 +469,47 @@ class WebRAGService:
         self._remember(prefix, document)
         return document
 
+    def _embed_missing(self, documents: Sequence[StoredDocument], conversation_id: str) -> None:
+        """
+        Bổ sung embedding cho tài liệu chưa có (hoặc embedding bằng model khác) khi
+        embedder dùng được, để tài liệu upload lúc hết quota được nâng lên tìm kiếm hybrid.
+        """
+        embedder = self.embedder
+        if embedder is None or time.time() < self._embedding_rest_until:
+            return
+
+        for document in documents:
+            if document.vectors is not None and document.meta.get("embedding_model") == embedder.model:
+                continue
+            try:
+                vectors = embedder.embed_documents(
+                    [chunk["content"] for chunk in document.chunks],
+                    title=PurePath(document.meta["stored_name"]).stem,
+                )
+            except Exception as error:
+                logger.warning("Chưa bổ sung được embedding cho %s: %s", document.meta["filename"], error)
+                if is_rate_limit_error(error):
+                    self._embedding_rest_until = time.time() + EMBEDDING_REST_SECONDS
+                return
+
+            prefix = f"{conversation_id}/{document.meta['id']}"
+            buffer = io.BytesIO()
+            np.save(buffer, vectors.astype(np.float32), allow_pickle=False)
+            self.storage.put(f"{prefix}/{EMBEDDINGS_FILE}", buffer.getvalue(), "application/octet-stream")
+
+            document.vectors = vectors
+            document.meta.update(
+                search="hybrid",
+                embedding_model=embedder.model,
+                dimensions=int(vectors.shape[1]),
+                warning=None,
+            )
+            self.storage.put(
+                f"{prefix}/{META_FILE}",
+                json.dumps(document.meta, ensure_ascii=False).encode("utf-8"),
+                "application/json",
+            )
+
     # ------------------------------------------------------------------ question answering
     def _retrieve(
         self,
@@ -486,7 +552,7 @@ class WebRAGService:
                 logger.warning("Không tạo được embedding cho câu hỏi: %s", error)
                 query_vectors = None
                 warnings.append(
-                    f"Tìm kiếm ngữ nghĩa tạm thời không dùng được ({describe_error(error)}); "
+                    f"Tìm kiếm ngữ nghĩa tạm thời không dùng được ({describe_embedding_error(error)}); "
                     "câu trả lời dựa trên tìm kiếm từ khoá."
                 )
             if query_vectors is not None:
@@ -607,6 +673,7 @@ class WebRAGService:
 
         yield status("retrieving", f"Đang tìm trong {len(metas)} tài liệu")
         documents = [self._load_document(meta, conversation_id) for meta in metas]
+        self._embed_missing(documents, conversation_id)
         hits, search_warnings = self._retrieve(documents, analysis.sub_queries or [analysis.standalone_question])
 
         yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
