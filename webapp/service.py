@@ -22,12 +22,20 @@ from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import PurePath
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 from langchain_core.documents import Document
 
-from RAG.gen import LLMClient, create_llm, fill_template, is_rate_limit_error, load_prompts, redact_secrets
+from RAG.gen import (
+    FallbackLLM,
+    LLMClient,
+    create_llm,
+    fill_template,
+    is_rate_limit_error,
+    load_prompts,
+    redact_secrets,
+)
 from RAG.reasoning import (
     QueryAnalysis,
     QueryAnalyzer,
@@ -74,6 +82,8 @@ MODES: Dict[str, str] = {
     "reasoning": "LLM + RAG + Reasoning",
 }
 COMPARE_ORDER = ("llm", "rag", "rerank", "reasoning")
+# Chế độ so sánh dùng một model cố định: số lần tối đa chờ hạn mức Groq rồi thử lại cho mỗi lần gọi
+COMPARE_MAX_RETRIES = 4
 STAGE_LABELS: Dict[str, str] = {
     "analyzing": "Phân tích câu hỏi",
     "retrieving": "Tìm đoạn liên quan",
@@ -129,37 +139,47 @@ class StoredDocument:
 class StageTimer:
     """
     Đo thời gian từng bước xử lý của một câu hỏi (giây).
+
+    Thời gian chờ Groq cấp lại hạn mức (wait_source: tổng số giây đã chờ) không tính
+    vào từng bước và tổng, mà ghi riêng ở "rate_limit_wait".
     """
 
-    def __init__(self) -> None:
+    def __init__(self, wait_source: Optional[Callable[[], float]] = None) -> None:
         self.started = time.perf_counter()
         self.timings: Dict[str, float] = {}
         self._stage: Optional[str] = None
         self._stage_started = self.started
+        self._wait_source = wait_source or (lambda: 0.0)
+        self._stage_waited = 0.0
 
     def elapsed(self) -> float:
-        return round(time.perf_counter() - self.started, 3)
+        return round(time.perf_counter() - self.started - self._wait_source(), 3)
 
     def start(self, stage: str) -> None:
         self._close()
         self._stage = stage
         self._stage_started = time.perf_counter()
+        self._stage_waited = self._wait_source()
 
     def finish(self) -> Dict[str, float]:
         self._close()
         self.timings["total"] = self.elapsed()
+        waited = self._wait_source()
+        if waited:
+            self.timings["rate_limit_wait"] = round(waited, 3)
         return dict(self.timings)
 
     def _close(self) -> None:
         if self._stage:
-            self.timings[self._stage] = round(time.perf_counter() - self._stage_started, 3)
+            waited = self._wait_source() - self._stage_waited
+            self.timings[self._stage] = round(time.perf_counter() - self._stage_started - waited, 3)
             self._stage = None
 
 
 class UsageRecorder:
     """
-    Bọc LLM để đếm số lần gọi, số token và model đã trả lời trong một lần chạy
-    (chỉ số dùng để so sánh / đánh giá các phương pháp).
+    Bọc LLM để đếm số lần gọi, số token, model đã trả lời và thời gian chờ hạn mức
+    trong một lần chạy (chỉ số dùng để so sánh / đánh giá các phương pháp).
     """
 
     def __init__(self, llm: LLMClient) -> None:
@@ -168,6 +188,7 @@ class UsageRecorder:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.waited = 0.0
 
     def generate(
         self,
@@ -176,7 +197,11 @@ class UsageRecorder:
         json_schema: Optional[Dict[str, Any]] = None,
         thinking_level: Optional[str] = None,
     ) -> str:
-        text = self.llm.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
+        try:
+            text = self.llm.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
+        finally:
+            # Kể cả khi lỗi (vd. reranking lỗi rồi dùng thứ tự cũ): thời gian chờ vẫn đã trôi qua
+            self.waited += float(getattr(self.llm, "last_wait", 0.0) or 0.0)
         self.calls += 1
         model = getattr(self.llm, "last_used", None)
         if model and model not in self.models:
@@ -317,6 +342,37 @@ class WebRAGService:
                 except ValueError as error:
                     raise ServiceError(503, str(error)) from error
             return self._llm
+
+    def compare_llm(self, deadline: Optional[float] = None) -> LLMClient:
+        """
+        LLM cho chế độ so sánh: cả 4 phương pháp dùng cùng một model (COMPARE_MODEL,
+        mặc định model đầu tiên của GROQ_MODELS) để so sánh công bằng. Chạm giới hạn
+        theo phút thì chờ Groq cấp lại hạn mức thay vì chuyển sang model khác.
+
+        Args:
+            deadline: Mốc thời gian (time.time()) không được chờ vượt quá
+        """
+        base = self.llm
+        if not isinstance(base, FallbackLLM):
+            return base  # LLM tự cung cấp (vd. khi test): dùng nguyên
+
+        model = self.settings.compare_model.strip()
+        if model.startswith("groq/"):
+            model = model[len("groq/"):]
+        name = f"groq/{model}" if model else base.names[0]
+        client = dict(base.providers).get(name)
+        if client is None:
+            # Model không nằm trong GROQ_MODELS: tạo riêng
+            try:
+                client = create_llm(models=[model], thinking_level=self.settings.thinking_level).providers[0][1]
+            except ValueError as error:
+                raise ServiceError(503, str(error)) from error
+        return FallbackLLM(
+            [(name, client)],
+            max_wait_seconds=self.settings.compare_max_wait,
+            max_retries=COMPARE_MAX_RETRIES,
+            deadline=deadline,
+        )
 
     # ------------------------------------------------------------------ validation
     @staticmethod
@@ -744,8 +800,9 @@ class WebRAGService:
         Mỗi phương pháp sinh ra các sự kiện (đều có trường "mode"):
         {"type": "start", "stages": [...]}, {"type": "status", "elapsed": ...} cho từng bước,
         rồi {"type": "result", "timings": {...}, "usage": {...}, "models": [...], ...}.
-        Chế độ "compare" kết thúc bằng {"type": "done"}; phương pháp nào lỗi thì gửi
-        {"type": "error", "mode": ...} và các phương pháp còn lại vẫn chạy tiếp.
+        Chế độ "compare" dùng cùng một model cho cả 4 phương pháp (báo trước bằng
+        {"type": "compare", "model": ...}) và kết thúc bằng {"type": "done"}; phương pháp nào
+        lỗi thì gửi {"type": "error", "mode": ...} và các phương pháp còn lại vẫn chạy tiếp.
         """
         self.check_conversation_id(conversation_id)
         if mode != "compare" and mode not in MODES:
@@ -761,13 +818,32 @@ class WebRAGService:
             yield from self._run_mode(mode, conversation_id, question, history, metas)
             return
 
+        deadline = time.time() + self.settings.compare_time_budget
+        llm = self.compare_llm(deadline)
+        pinned = llm.names[0] if isinstance(llm, FallbackLLM) else None
+        if pinned:
+            yield {"type": "compare", "model": pinned}
+
         for item in COMPARE_ORDER:
+            if time.time() > deadline:
+                yield {
+                    "type": "error",
+                    "mode": item,
+                    "message": "Đã bỏ qua vì sắp hết thời gian xử lý tối đa của server. Hãy hỏi riêng phương pháp này.",
+                }
+                continue
             try:
-                yield from self._run_mode(item, conversation_id, question, history, metas)
+                yield from self._run_mode(item, conversation_id, question, history, metas, llm=llm)
             except Exception as error:
                 if not isinstance(error, ServiceError):
                     logger.exception("Lỗi khi chạy phương pháp %s", item)
-                yield {"type": "error", "mode": item, "message": describe_error(error)}
+                message = describe_error(error)
+                if pinned and is_rate_limit_error(error):
+                    message = (
+                        f"Model {pinned} đã chạm giới hạn của Groq và phải chờ quá lâu để so sánh trên cùng một model. "
+                        "Thử lại sau ít phút, hoặc hỏi riêng phương pháp này (tự chuyển model khi hết quota)."
+                    )
+                yield {"type": "error", "mode": item, "message": message}
         yield {"type": "done"}
 
     def _run_mode(
@@ -777,6 +853,7 @@ class WebRAGService:
         question: str,
         history: Sequence[Tuple[str, str]],
         metas: List[Dict[str, Any]],
+        llm: Optional[LLMClient] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Chạy một phương pháp:
@@ -784,9 +861,12 @@ class WebRAGService:
         - rag:       tìm top_n đoạn theo câu hỏi gốc -> prompt RAG cơ bản
         - rerank:    tìm nhiều đoạn ứng viên -> LLM xếp hạng lại -> top_n -> prompt RAG cơ bản
         - reasoning: phân tích câu hỏi -> tìm theo truy vấn con -> suy luận có trích dẫn -> kiểm chứng
+
+        Args:
+            llm: LLM dùng cho lần chạy này (mặc định self.llm, tự chuyển model khi hết quota)
         """
-        llm = UsageRecorder(self.llm)
-        timer = StageTimer()
+        llm = UsageRecorder(llm or self.llm)
+        timer = StageTimer(lambda: llm.waited)
         use_rerank = mode == "rerank" or (mode == "reasoning" and self.settings.reasoning_rerank)
 
         stages = {

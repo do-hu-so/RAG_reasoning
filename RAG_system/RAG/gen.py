@@ -288,9 +288,11 @@ class FallbackLLM:
     sang model kế tiếp.
 
     - Model vừa hết quota được "nghỉ" theo header retry-after (hoặc 60 giây).
-    - Mọi model đều đang chạm giới hạn theo phút (chỉ cần chờ ngắn) thì chờ rồi thử lại
-      một lần, thay vì báo lỗi ngay.
-    - Ghi lại model đã trả lời (last_used, riêng cho từng luồng xử lý) để hiển thị.
+    - Mọi model đều đang chạm giới hạn theo phút (chỉ cần chờ ngắn, <= max_wait_seconds)
+      thì chờ rồi thử lại (tối đa max_retries lần, không vượt deadline), thay vì báo lỗi.
+      Với một model duy nhất, đây là cách "cố định model": chờ hạn mức thay vì đổi model.
+    - Ghi lại model đã trả lời (last_used), số token (last_usage) và tổng thời gian đã chờ
+      (last_wait) của lần gọi gần nhất, riêng cho từng luồng xử lý.
     """
 
     def __init__(
@@ -298,14 +300,33 @@ class FallbackLLM:
         providers: Sequence[Tuple[str, LLMClient]],
         cooldown_seconds: float = 60.0,
         max_wait_seconds: float = 20.0,
+        max_retries: int = 1,
+        deadline: Optional[float] = None,
     ) -> None:
+        """
+        Args:
+            providers: Các cặp (tên, client) theo thứ tự ưu tiên
+            cooldown_seconds: Thời gian nghỉ khi lỗi 429 không kèm retry-after
+            max_wait_seconds: Chỉ chờ khi thời gian cần chờ không quá giá trị này
+            max_retries: Số lần chờ-rồi-thử-lại tối đa cho mỗi lần gọi
+            deadline: Mốc thời gian (time.time()) không được chờ vượt quá
+        """
         if not providers:
             raise ValueError("FallbackLLM cần ít nhất một model")
         self.providers = list(providers)
         self.cooldown_seconds = cooldown_seconds
         self.max_wait_seconds = max_wait_seconds
+        self.max_retries = max_retries
+        self.deadline = deadline
         self._resting_until: Dict[str, float] = {}
         self._local = threading.local()
+
+    @property
+    def last_wait(self) -> float:
+        """
+        Tổng số giây đã chờ hạn mức trong lần gọi gần nhất của luồng hiện tại.
+        """
+        return getattr(self._local, "last_wait", 0.0)
 
     @property
     def names(self) -> List[str]:
@@ -333,7 +354,9 @@ class FallbackLLM:
         thinking_level: Optional[str] = None,
     ) -> str:
         last_error: Optional[Exception] = None
-        for attempt in range(2):
+        waited = 0.0
+        self._local.last_wait = 0.0
+        for attempt in range(self.max_retries + 1):
             now = time.time()
             # Ưu tiên model không trong thời gian nghỉ, giữ nguyên thứ tự cấu hình
             ordered = sorted(self.providers, key=lambda item: self._resting_until.get(item[0], 0) > now)
@@ -344,6 +367,7 @@ class FallbackLLM:
                     text = client.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
                     self._local.last_used = name
                     self._local.last_usage = getattr(client, "last_usage", None)
+                    self._local.last_wait = waited
                     return text
                 except Exception as error:
                     last_error = error
@@ -353,14 +377,25 @@ class FallbackLLM:
                         waits.append(rest)
                     else:
                         waits.append(None)
-                    logger.warning("LLM %s lỗi (%s), chuyển sang model kế tiếp.", name, redact_secrets(error))
+                    logger.warning(
+                        "LLM %s lỗi (%s)%s", name, redact_secrets(error),
+                        ", chuyển sang model kế tiếp." if len(self.providers) > 1 else ".",
+                    )
 
-            # Tất cả đều chỉ bị giới hạn theo phút -> chờ model sớm nhất rồi thử lại một lần
+            # Tất cả đều chỉ bị giới hạn theo phút -> chờ model sớm nhất rồi thử lại
             shortest = min((wait for wait in waits if wait is not None), default=None)
-            if attempt == 0 and None not in waits and shortest is not None and shortest <= self.max_wait_seconds:
-                time.sleep(shortest)
-                continue
-            break
+            can_wait = (
+                attempt < self.max_retries
+                and None not in waits
+                and shortest is not None
+                and shortest <= self.max_wait_seconds
+                and (self.deadline is None or time.time() + shortest <= self.deadline)
+            )
+            if not can_wait:
+                break
+            time.sleep(shortest)
+            waited += shortest
+        self._local.last_wait = waited
         raise last_error
 
 

@@ -48,6 +48,13 @@ class WebSettings:
     thinking_level: str = field(default_factory=lambda: _env_str("GROQ_REASONING_EFFORT", DEFAULT_THINKING_LEVEL))
     analysis_thinking_level: str = DEFAULT_ANALYSIS_THINKING_LEVEL
 
+    # Chế độ so sánh: cả 4 phương pháp dùng cùng một model (mặc định model đầu tiên của GROQ_MODELS)
+    compare_model: str = field(default_factory=lambda: _env_str("COMPARE_MODEL", ""))
+    # Chạm giới hạn token/phút thì chờ Groq cấp lại hạn mức, tối đa bấy nhiêu giây mỗi lần (không đổi model)
+    compare_max_wait: int = field(default_factory=lambda: _env_int("COMPARE_MAX_WAIT", 65))
+    # Thời gian tối đa của một lượt so sánh (Vercel Hobby dừng hàm sau 300 giây)
+    compare_time_budget: int = field(default_factory=lambda: _env_int("COMPARE_TIME_BUDGET", 240))
+
     # auto: Cloudflare nếu có key, không thì chỉ tìm từ khoá; hoặc cloudflare | none
     embedding_provider: str = field(default_factory=lambda: _env_str("WEB_EMBEDDING_PROVIDER", "auto"))
     embedding_model: str = field(default_factory=lambda: _env_str("CLOUDFLARE_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))

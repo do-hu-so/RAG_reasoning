@@ -59,11 +59,14 @@ Nút chọn phương pháp nằm cạnh ô nhập câu hỏi. Mặc định là 
 | 04 | LLM + RAG + Reasoning | Phân tích & viết lại câu hỏi, tách truy vấn con → tìm đoạn → suy luận từng bước có trích dẫn → kiểm chứng trích dẫn | 2 |
 
 - Cả 4 phương pháp dùng **cùng một bộ tìm kiếm** (BM25, cộng thêm ngữ nghĩa nếu có Cloudflare), nên khác biệt giữa 02, 03 và 04 chỉ đến từ reranking và reasoning.
-- **Chỉ số hiện cho từng phương pháp:** thời gian phản hồi (kèm thời gian từng bước), số lần gọi LLM, số token vào/ra, số đoạn tài liệu, model đã trả lời. Riêng 04 có thêm độ tin cậy và số trích dẫn khớp tài liệu. Hộp "Văn bản gốc" hiện đúng các đoạn đã đưa cho LLM; với 03 có thêm điểm rerank và thứ hạng trước khi rerank.
+- **Chỉ số hiện cho từng phương pháp:** thời gian phản hồi (kèm thời gian từng bước, không tính thời gian chờ hạn mức Groq), số lần gọi LLM, số token vào/ra, số đoạn tài liệu, model đã trả lời. Riêng 04 có thêm độ tin cậy và số trích dẫn khớp tài liệu. Hộp "Văn bản gốc" hiện đúng các đoạn đã đưa cho LLM; với 03 có thêm điểm rerank và thứ hạng trước khi rerank.
 - **Chấm điểm thủ công:** mỗi câu trả lời có nút Đúng / Một phần / Sai. Bảng tổng hợp dưới mỗi câu hỏi gom toàn bộ chỉ số và điểm đã chấm.
 - **Xuất đánh giá:** nút "Xuất đánh giá" trên thanh tiêu đề tải file CSV của cả cuộc trò chuyện (mở được bằng Excel / Google Sheets). Mỗi dòng gồm câu hỏi, phương pháp, các chỉ số, điểm chấm và câu trả lời.
 - **Lưu ý khi so sánh:**
-  - Khi một model Groq hết quota, app tự chuyển model. Nếu trong một lần so sánh các phương pháp dùng model khác nhau, bảng tổng hợp sẽ cảnh báo, vì khi đó so sánh chất lượng chưa hoàn toàn công bằng.
+  - **Chế độ so sánh dùng cùng một model cho cả 4 phương pháp** (mặc định model đầu tiên của `GROQ_MODELS`, tức `gpt-oss-120b`; đổi bằng `COMPARE_MODEL`). Tên model hiện ở đầu khung so sánh.
+  - Một lượt so sánh tốn khoảng 15–20 nghìn token, vượt hạn mức 8.000 token/phút của `gpt-oss-120b`. Khi chạm giới hạn, app **chờ Groq cấp lại hạn mức** (theo header `retry-after`, tối đa `COMPARE_MAX_WAIT` giây mỗi lần) thay vì đổi model. Thời gian chờ hiện riêng ("⏳ chờ quota") và **không cộng vào thời gian phản hồi** của từng phương pháp, nên so sánh tốc độ vẫn công bằng.
+  - Hạn mức theo ngày của `gpt-oss-120b` (200.000 token) đủ cho khoảng 10–15 câu hỏi so sánh. Hết hạn mức ngày thì phương pháp đó báo lỗi; khi đó có thể hỏi riêng từng phương pháp (vẫn tự chuyển model) hoặc đặt `COMPARE_MODEL` sang model khác.
+  - Khi hỏi riêng một phương pháp, app vẫn tự chuyển model khi hết quota. Nếu các phương pháp trong một lần so sánh dùng model khác nhau (tin nhắn cũ), bảng tổng hợp sẽ cảnh báo.
   - Bản web rerank bằng LLM, vì Vercel không chạy được cross-encoder; bản dòng lệnh dùng cross-encoder `bge-reranker-v2-m3`.
   - Phương pháp 04 mặc định không rerank, đúng nghĩa "RAG + Reasoning". Đặt `WEB_REASONING_RERANK=1` nếu muốn 04 gồm cả reranking.
 
@@ -164,6 +167,9 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 | `GROQ_API_KEY` | (bắt buộc) | API key Groq, lấy tại https://console.groq.com/keys |
 | `GROQ_MODELS` | `openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b,llama-3.1-8b-instant` | Các model theo thứ tự ưu tiên; hết quota model đầu thì dùng model sau |
 | `GROQ_REASONING_EFFORT` | `medium` | Mức suy luận của các model gpt-oss: `low`, `medium`, `high`, `off` |
+| `COMPARE_MODEL` | (model đầu tiên của `GROQ_MODELS`) | Model dùng chung cho cả 4 phương pháp ở chế độ so sánh, ví dụ `llama-3.3-70b-versatile` |
+| `COMPARE_MAX_WAIT` | `65` | Chế độ so sánh: chờ Groq cấp lại hạn mức tối đa bấy nhiêu giây mỗi lần; cần chờ lâu hơn thì báo lỗi |
+| `COMPARE_TIME_BUDGET` | `240` | Thời gian tối đa (giây) của một lượt so sánh, để không vượt giới hạn 300 giây của Vercel |
 | `WEB_EMBEDDING_PROVIDER` | `auto` | `auto` (Cloudflare nếu có key) / `cloudflare` / `none` (chỉ tìm từ khoá) |
 | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | (tuỳ chọn) | Embedding `bge-m3` qua Cloudflare Workers AI |
 | `BLOB_ACCESS` | `private` | Chế độ của Vercel Blob store |

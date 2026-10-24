@@ -140,6 +140,21 @@ class FakeLLM:
         raise AssertionError("schema không mong đợi")
 
 
+class RateLimitedLLM(FakeLLM):
+    """Model chạm giới hạn token/phút ở vài lần gọi đầu (chờ retry_after giây là gọi lại được)."""
+
+    def __init__(self, limited_calls=1, retry_after=0.2):
+        super().__init__()
+        self.limited_calls = limited_calls
+        self.retry_after = retry_after
+
+    def generate(self, prompt, system=None, json_schema=None, thinking_level=None):
+        if self.limited_calls:
+            self.limited_calls -= 1
+            raise ProviderError("groq", 429, "rate limit", retry_after=self.retry_after)
+        return super().generate(prompt, system, json_schema, thinking_level)
+
+
 def blank_pdf() -> bytes:
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
@@ -389,6 +404,54 @@ class TestModes(WebTestCase):
         self.assertEqual([event["mode"] for event in events if event["type"] == "result"], ["rag", "rerank", "reasoning"])
         self.assertEqual(events[-1]["type"], "done")
 
+    def use_llm(self, llm, **settings):
+        self.settings = WebSettings(local_dataset_dir=self.tmp, **settings)
+        self.service = WebRAGService(self.settings, LocalStorage(self.tmp), embedder=self.embedder,
+                                     llm=llm, prompts=load_prompts(WEB_PROMPT_FILE))
+        set_service(self.service)
+
+    def test_compare_pins_one_model_and_waits_for_quota(self):
+        main, backup = RateLimitedLLM(limited_calls=1), FakeLLM()
+        self.use_llm(FallbackLLM([("groq/main", main), ("groq/backup", backup)]))
+        self.upload()
+        events = self.ask(self.QUESTION, mode="compare")
+        self.assertEqual(events[0], {"type": "compare", "model": "groq/main"})
+
+        results = [event for event in events if event["type"] == "result"]
+        self.assertEqual([result["mode"] for result in results], ["llm", "rag", "rerank", "reasoning"])
+        self.assertTrue(all(result["models"] == ["groq/main"] for result in results))
+        self.assertEqual(backup.calls, [])  # chờ hạn mức thay vì chuyển model
+
+        # Thời gian chờ ghi riêng, không cộng vào thời gian xử lý
+        timings = results[0]["timings"]
+        self.assertGreaterEqual(timings["rate_limit_wait"], 0.2)
+        self.assertLess(timings["total"], 0.2)
+        self.assertLess(timings["generating"], 0.2)
+        self.assertTrue(all("rate_limit_wait" not in result["timings"] for result in results[1:]))
+
+    def test_single_mode_still_switches_model(self):
+        main, backup = RateLimitedLLM(limited_calls=1), FakeLLM()
+        self.use_llm(FallbackLLM([("groq/main", main), ("groq/backup", backup)]))
+        result = self.ask(self.QUESTION, mode="llm")[-1]
+        self.assertEqual(result["models"], ["groq/backup"])
+        self.assertNotIn("rate_limit_wait", result["timings"])
+
+    def test_compare_model_setting(self):
+        main, backup = FakeLLM(), FakeLLM()
+        self.use_llm(FallbackLLM([("groq/main", main), ("groq/backup", backup)]), compare_model="groq/backup")
+        events = self.ask(self.QUESTION, mode="compare")
+        self.assertEqual(events[0]["model"], "groq/backup")
+        self.assertEqual(main.calls, [])
+
+    def test_compare_reports_pinned_model_quota_error(self):
+        main = RateLimitedLLM(limited_calls=99, retry_after=600)  # hết hạn mức lâu: không chờ
+        self.use_llm(FallbackLLM([("groq/main", main), ("groq/backup", FakeLLM())]))
+        self.upload()
+        events = self.ask(self.QUESTION, mode="compare")
+        errors = [event for event in events if event["type"] == "error"]
+        self.assertEqual([event["mode"] for event in errors], ["llm", "rag", "rerank", "reasoning"])
+        self.assertIn("groq/main", errors[0]["message"])
+
     def test_rag_modes_without_documents(self):
         for mode in ("rag", "rerank"):
             self.assertIn("chưa có tài liệu", self.ask(self.QUESTION, mode=mode)[-1]["answer"])
@@ -620,6 +683,33 @@ class TestProviders(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertGreaterEqual(attempts[1] - attempts[0], 0.04)
         self.assertEqual(llm.last_used, "groq/only")
+        self.assertGreaterEqual(llm.last_wait, 0.05)
+
+    def test_pinned_model_waits_several_times_within_limits(self):
+        class Limited:
+            def __init__(self, failures):
+                self.failures = failures
+
+            def generate(self, prompt, system=None, json_schema=None, thinking_level=None):
+                if self.failures:
+                    self.failures -= 1
+                    raise ProviderError("groq", 429, "rate limit", retry_after=0.02)
+                return "ok"
+
+        llm = FallbackLLM([("groq/only", Limited(3))], max_retries=4)
+        self.assertEqual(llm.generate("hỏi"), "ok")
+        self.assertGreaterEqual(llm.last_wait, 0.06)
+        self.assertEqual(llm.generate("hỏi lần 2"), "ok")
+        self.assertEqual(llm.last_wait, 0.0)
+
+        # Cần chờ lâu hơn max_wait_seconds, hoặc chờ sẽ vượt deadline: báo lỗi ngay
+        too_long = FallbackLLM([("groq/only", Limited(1))], max_wait_seconds=0.01, max_retries=4)
+        with self.assertRaises(ProviderError):
+            too_long.generate("hỏi")
+        late = FallbackLLM([("groq/only", Limited(1))], max_retries=4, deadline=time.time())
+        with self.assertRaises(ProviderError):
+            late.generate("hỏi")
+        self.assertEqual(late.last_wait, 0.0)
 
     def test_rate_limit_rest_uses_retry_after(self):
         client = OpenAICompatibleClient("groq", "https://x/v1", "k", "m1", http_client=mock_http(

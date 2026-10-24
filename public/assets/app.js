@@ -35,6 +35,8 @@
     reasoning: "Suy luận & kiểm chứng"
   };
   var STAGE_ORDER = ["analyzing", "retrieving", "reranking", "generating", "reasoning"];
+  var WAIT_LABEL = "Chờ hạn mức Groq (không tính vào tổng)";
+  var WAIT_HINT = "Thời gian chờ Groq cấp lại hạn mức token/phút để giữ cùng một model; không tính vào thời gian phản hồi.";
 
   var RATINGS = [
     { key: "correct", label: "Đúng", icon: "✓" },
@@ -637,9 +639,16 @@
     });
   }
 
-  /** Tổng thời gian phản hồi người dùng thấy (giây). */
+  /** Số giây chờ Groq cấp lại hạn mức token/phút (chế độ so sánh dùng cố định một model). */
+  function waitSeconds(run) {
+    var timings = run && run.result && run.result.timings;
+    return (timings && timings.rate_limit_wait) || 0;
+  }
+
+  /** Thời gian phản hồi người dùng thấy (giây), không tính thời gian chờ hạn mức Groq. */
   function responseSeconds(run) {
-    return (run && (run.totalSeconds || run.duration)) || null;
+    var total = run && (run.totalSeconds || run.duration);
+    return total ? Math.max(total - waitSeconds(run), 0) : null;
   }
 
   function metricChip(icon, text, title) {
@@ -654,6 +663,7 @@
     var sources = result.sources || [];
 
     if (total) row.append(metricChip(ICONS.clock, formatSeconds(total), timingTooltip(run, result)));
+    if (waitSeconds(run)) row.append(metricChip(null, "⏳ chờ quota " + formatSeconds(waitSeconds(run)), WAIT_HINT));
     if (usage.llm_calls) row.append(metricChip(null, usage.llm_calls + " lần gọi LLM"));
     if (usage.prompt_tokens || usage.completion_tokens) {
       row.append(metricChip(null, formatNumber(usage.prompt_tokens + usage.completion_tokens) + " token",
@@ -782,7 +792,9 @@
   }
 
   function timingTooltip(run, result) {
-    return timingRows(run, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); }).join("\n");
+    var lines = timingRows(run, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); });
+    if (waitSeconds(run)) lines.push(WAIT_LABEL + ": " + formatSeconds(waitSeconds(run)));
+    return lines.join("\n");
   }
 
   function renderThinking(run, result) {
@@ -817,6 +829,7 @@
       var table = h("dl", { class: "timing-table" });
       rows.forEach(function (row) { table.append(h("dt", {}, row[0]), h("dd", {}, formatSeconds(row[1]))); });
       if (total) table.append(h("dt", { class: "total" }, "Tổng thời gian phản hồi"), h("dd", { class: "total" }, formatSeconds(total)));
+      if (waitSeconds(run)) table.append(h("dt", { class: "wait" }, WAIT_LABEL), h("dd", { class: "wait" }, formatSeconds(waitSeconds(run))));
       body.append(h("h4", {}, "Thời gian xử lý"), table);
     }
     return h("details", { class: "thinking", "data-key": "thinking" }, h("summary", {}, label), body);
@@ -825,11 +838,17 @@
   // ------------------------------------------------------------------ so sánh 4 phương pháp
   function renderCompareMessage(msg) {
     var done = msg.status === "done";
+    var waited = msg.modes.reduce(function (sum, mode) { return sum + waitSeconds(msg.runs[mode]); }, 0);
     var head = h("div", { class: "compare-head" },
       h("span", { class: "compare-title" }, "So sánh 4 phương pháp"),
+      msg.pinnedModel
+        ? metricChip(null, "Cùng model: " + shortModel(msg.pinnedModel),
+          "Cả 4 phương pháp dùng cùng một model. Khi chạm giới hạn token/phút, app chờ Groq cấp lại hạn mức thay vì đổi model.")
+        : null,
       done && msg.totalSeconds
-        ? metricChip(ICONS.clock, "Tổng " + formatSeconds(msg.totalSeconds))
-        : h("span", { class: "live-total compare-live-total" }, formatSeconds((Date.now() - msg.startedAt) / 1000))
+        ? metricChip(ICONS.clock, "Tổng " + formatSeconds(msg.totalSeconds), waited ? "Gồm " + formatSeconds(waited) + " chờ hạn mức Groq" : null)
+        : h("span", { class: "live-total compare-live-total" }, formatSeconds((Date.now() - msg.startedAt) / 1000)),
+      done && waited ? metricChip(null, "⏳ chờ quota " + formatSeconds(waited), WAIT_HINT) : null
     );
 
     var grid = h("div", { class: "compare-grid" }, msg.modes.map(function (mode) {
@@ -859,7 +878,8 @@
       var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
       return h("tr", { class: run.rating ? "rated-" + run.rating : null },
         h("td", {}, modeTag(mode, true)),
-        h("td", {}, run.status === "done" ? formatSeconds(responseSeconds(run)) : run.status === "error" ? "Lỗi" : "—"),
+        h("td", {}, run.status === "done" ? formatSeconds(responseSeconds(run)) : run.status === "error" ? "Lỗi" : "—",
+          waitSeconds(run) ? h("small", { class: "wait-note", title: WAIT_HINT }, " (+" + formatSeconds(waitSeconds(run)) + " chờ)") : null),
         h("td", {}, usage.llm_calls || "—"),
         h("td", {}, tokens ? formatNumber(tokens) : "—"),
         h("td", {}, mode === "llm" ? "Không dùng" : result.sources ? String(result.sources.length) : "—"),
@@ -933,7 +953,9 @@
     var run = key ? msg.runs[key] : null;
     var now = Date.now();
 
-    if (event.type === "start" && run) {
+    if (event.type === "compare") {
+      msg.pinnedModel = event.model;
+    } else if (event.type === "start" && run) {
       run.status = "pending";
       run.stages = event.stages || [];
       run.stageTimes = {};
@@ -1046,7 +1068,7 @@
   function exportEvaluation() {
     var conv = current();
     var rows = [[
-      "STT", "Câu hỏi", "Phương pháp", "Thời gian (giây)", "Số lần gọi LLM", "Token vào", "Token ra",
+      "STT", "Câu hỏi", "Phương pháp", "Thời gian (giây)", "Chờ hạn mức Groq (giây)", "Số lần gọi LLM", "Token vào", "Token ra",
       "Số đoạn tài liệu", "Model", "Độ tin cậy", "Trích dẫn khớp", "Đánh giá", "Câu trả lời"
     ]];
     var question = "";
@@ -1071,6 +1093,7 @@
           question,
           MODES[mode].num + " " + MODES[mode].title,
           run.status === "done" && responseSeconds(run) ? responseSeconds(run).toFixed(2) : "",
+          waitSeconds(run) ? waitSeconds(run).toFixed(2) : "",
           usage.llm_calls || "",
           usage.prompt_tokens || "",
           usage.completion_tokens || "",
