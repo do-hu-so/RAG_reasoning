@@ -2,6 +2,8 @@
    RAG Reasoning — logic giao diện chat
    - Lịch sử cuộc trò chuyện lưu trong localStorage của trình duyệt
    - Tài liệu PDF lưu trên server ("dataset web"), theo từng cuộc trò chuyện
+   - 4 phương pháp trả lời (01 LLM thuần, 02 RAG thuần, 03 RAG + Reranking,
+     04 RAG + Reasoning) và chế độ so sánh cả 4 để đánh giá
    ========================================================================= */
 (function () {
   "use strict";
@@ -9,16 +11,35 @@
   var STORAGE_KEY = "rag.conversations.v1";
   var CURRENT_KEY = "rag.current";
   var THEME_KEY = "rag.theme";
+  var MODE_KEY = "rag.mode";
   var HISTORY_TURNS = 4;
   var MAX_CONVERSATIONS = 40;
   var DEFAULT_TITLE = "Cuộc trò chuyện mới";
+  var DEFAULT_MODE = "compare";
   var WIDE_SCREEN = 1200; // từ độ rộng này hộp trích dẫn tự mở cạnh câu trả lời
 
-  // Các bước xử lý một câu hỏi (khớp với "stage" server gửi về)
-  var STAGES = [
-    { key: "analyzing", label: "Phân tích câu hỏi" },
-    { key: "retrieving", label: "Tìm đoạn liên quan" },
-    { key: "reasoning", label: "Suy luận & kiểm chứng" }
+  var MODES = {
+    llm: { num: "01", title: "LLM thuần, không RAG", short: "LLM thuần", desc: "Chỉ hỏi LLM, không dùng tài liệu." },
+    rag: { num: "02", title: "LLM + RAG thuần", short: "RAG thuần", desc: "Tìm các đoạn liên quan rồi đưa thẳng cho LLM." },
+    rerank: { num: "03", title: "LLM + RAG + Reranking", short: "RAG + Rerank", desc: "Tìm nhiều đoạn, xếp hạng lại, giữ các đoạn tốt nhất." },
+    reasoning: { num: "04", title: "LLM + RAG + Reasoning", short: "RAG + Reasoning", desc: "Phân tích câu hỏi, suy luận có trích dẫn và kiểm chứng." },
+    compare: { num: "⇄", title: "So sánh cả 4 phương pháp", short: "So sánh 4", desc: "Mỗi câu hỏi chạy lần lượt cả 4 cách, hiện cạnh nhau để đánh giá." }
+  };
+  var MODE_ORDER = ["llm", "rag", "rerank", "reasoning"];
+
+  var STAGE_LABELS = {
+    analyzing: "Phân tích câu hỏi",
+    retrieving: "Tìm đoạn liên quan",
+    reranking: "Xếp hạng lại (rerank)",
+    generating: "Sinh câu trả lời",
+    reasoning: "Suy luận & kiểm chứng"
+  };
+  var STAGE_ORDER = ["analyzing", "retrieving", "reranking", "generating", "reasoning"];
+
+  var RATINGS = [
+    { key: "correct", label: "Đúng", icon: "✓" },
+    { key: "partial", label: "Một phần", icon: "≈" },
+    { key: "wrong", label: "Sai", icon: "✗" }
   ];
 
   var ICONS = {
@@ -47,6 +68,7 @@
     convTitle: $("conv-title"),
     docsBtn: $("docs-btn"),
     docsCount: $("docs-count"),
+    exportBtn: $("export-btn"),
     banner: $("banner"),
     main: $("main"),
     messages: $("messages"),
@@ -56,6 +78,11 @@
     sendBtn: $("send-btn"),
     attachBtn: $("attach-btn"),
     fileInput: $("file-input"),
+    modePicker: $("mode-picker"),
+    modeBtn: $("mode-btn"),
+    modeNum: $("mode-num"),
+    modeLabel: $("mode-label"),
+    modeMenu: $("mode-menu"),
     dropOverlay: $("drop-overlay"),
     uploadHint: $("upload-hint"),
     docsPanel: $("docs-panel"),
@@ -118,6 +145,15 @@
     return Math.max(1, Math.round(bytes / 1024)) + " KB";
   }
 
+  function formatNumber(value) {
+    return Number(value || 0).toLocaleString("vi-VN");
+  }
+
+  /** "groq/openai/gpt-oss-120b" -> "gpt-oss-120b" */
+  function shortModel(name) {
+    return String(name || "").replace(/^groq\//, "").replace(/^openai\//, "");
+  }
+
   function newId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "");
     var bytes = new Uint8Array(16);
@@ -133,7 +169,8 @@
     busy: false,
     uploads: {},
     config: { max_upload_mb: 4 },
-    cite: { msgId: null, focus: null }
+    mode: loadMode(),
+    cite: { msgId: null, mode: null, focus: null }
   };
 
   function loadConversations() {
@@ -143,6 +180,12 @@
     } catch (e) {
       return [];
     }
+  }
+
+  function loadMode() {
+    var mode = null;
+    try { mode = localStorage.getItem(MODE_KEY); } catch (e) { mode = null; }
+    return MODES[mode] ? mode : DEFAULT_MODE;
   }
 
   function saveConversations() {
@@ -187,6 +230,29 @@
 
   function totalPendingUploads() { return Object.keys(state.uploads).length; }
 
+  /**
+   * Tin nhắn trả lời gồm kết quả theo từng phương pháp: msg.modes (thứ tự) và
+   * msg.runs[mode] = { status, stages, result, error, totalSeconds, rating, ... }.
+   * Tin nhắn cũ (trước khi có nhiều phương pháp) được chuyển thành phương pháp 04.
+   */
+  function normalizeAssistant(msg) {
+    if (msg.role !== "assistant" || msg.runs) return;
+    msg.mode = "reasoning";
+    msg.modes = ["reasoning"];
+    msg.runs = {
+      reasoning: {
+        status: msg.status === "pending" ? "error" : msg.status,
+        result: msg.result,
+        error: msg.error || (msg.status === "pending" ? "Câu trả lời bị gián đoạn." : undefined),
+        totalSeconds: msg.totalSeconds || msg.duration || null
+      }
+    };
+    msg.status = "done";
+    delete msg.result;
+    delete msg.error;
+    delete msg.duration;
+  }
+
   // ------------------------------------------------------------------ API
   function api(path) { return "/api/conversations/" + encodeURIComponent(state.currentId) + path; }
 
@@ -200,11 +266,11 @@
     });
   }
 
-  async function streamAsk(conversationId, question, history, onEvent) {
+  async function streamAsk(conversationId, question, history, mode, onEvent) {
     var response = await fetch("/api/conversations/" + encodeURIComponent(conversationId) + "/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: question, history: history })
+      body: JSON.stringify({ question: question, history: history, mode: mode })
     });
     if (!response.ok) throw new Error(await readError(response));
 
@@ -288,6 +354,65 @@
 
   function closeSidebarMobile() { els.app.classList.remove("sidebar-open"); }
 
+  // ------------------------------------------------------------------ chọn phương pháp
+  function setMode(mode) {
+    if (!MODES[mode]) return;
+    state.mode = mode;
+    try { localStorage.setItem(MODE_KEY, mode); } catch (e) { /* bỏ qua */ }
+    renderModePicker();
+    var conv = current();
+    if (!conv || !conv.messages.length) renderMessages();
+  }
+
+  function modeMenuItem(mode) {
+    var info = MODES[mode];
+    var active = state.mode === mode;
+    return h("button", {
+      type: "button", role: "menuitemradio", "aria-checked": active ? "true" : "false",
+      class: "mode-item" + (active ? " active" : "") + (mode === "compare" ? " compare" : ""),
+      onclick: function () {
+        setMode(mode);
+        closeModeMenu();
+        els.input.focus();
+      }
+    },
+      h("span", { class: "mode-num" }, info.num),
+      h("span", { class: "mode-item-text" }, h("strong", {}, info.title), h("small", {}, info.desc)),
+      active ? h("span", { class: "mode-check", html: ICONS.check }) : null
+    );
+  }
+
+  function renderModePicker() {
+    var info = MODES[state.mode];
+    els.modeNum.textContent = info.num;
+    els.modeLabel.textContent = info.short;
+    els.modeBtn.classList.toggle("is-compare", state.mode === "compare");
+    els.modeBtn.title = "Phương pháp: " + info.title;
+    els.input.placeholder = state.mode === "compare" ? "Hỏi để so sánh 4 cách…" : "Hỏi về tài liệu của bạn…";
+    els.modeMenu.textContent = "";
+    els.modeMenu.append(h("div", { class: "mode-menu-title" }, "Phương pháp trả lời"));
+    MODE_ORDER.forEach(function (mode) { els.modeMenu.append(modeMenuItem(mode)); });
+    els.modeMenu.append(h("div", { class: "mode-menu-sep" }), modeMenuItem("compare"));
+  }
+
+  function openModeMenu() {
+    els.modeMenu.hidden = false;
+    els.modeBtn.setAttribute("aria-expanded", "true");
+  }
+
+  function closeModeMenu() {
+    els.modeMenu.hidden = true;
+    els.modeBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function modeTag(mode, short) {
+    var info = MODES[mode] || MODES.reasoning;
+    return h("span", { class: "mode-tag" + (short ? " short" : "") },
+      h("span", { class: "mode-num" }, info.num),
+      h("span", { class: "mode-title" }, short ? info.short : info.title)
+    );
+  }
+
   // ------------------------------------------------------------------ messages
   function renderAll() {
     var conv = current();
@@ -338,18 +463,28 @@
 
   function renderEmptyState() {
     var maxMb = state.config.max_upload_mb || 4;
+    var modeRow = function (mode) {
+      var info = MODES[mode];
+      return h("button", {
+        type: "button", class: "mode-row" + (state.mode === mode ? " active" : "") + (mode === "compare" ? " compare" : ""),
+        onclick: function () { setMode(mode); }
+      },
+        h("span", { class: "mode-num" }, info.num),
+        h("span", { class: "mode-row-text" }, h("strong", {}, info.title), h("small", {}, info.desc))
+      );
+    };
     return h("div", { class: "empty" },
       h("h2", {}, "Hỏi đáp tài liệu PDF với RAG reasoning"),
-      h("p", {}, "Tải PDF lên, hệ thống sẽ đọc, tạo embedding rồi trả lời câu hỏi của bạn bằng suy luận từng bước kèm trích dẫn nguồn."),
+      h("p", {}, "Tải PDF lên rồi đặt câu hỏi. Có thể so sánh 4 phương pháp trả lời ngay trên màn hình để đánh giá."),
       h("button", { class: "dropzone", type: "button", onclick: function () { els.fileInput.click(); } },
         h("span", { html: ICONS.upload }),
         h("strong", {}, "Kéo thả hoặc bấm để chọn file PDF"),
         h("span", {}, "Tối đa " + maxMb + " MB mỗi file · PDF có lớp chữ (không phải bản scan)")
       ),
-      h("div", { class: "features" },
-        h("div", { class: "feature" }, h("b", {}, "Trích dẫn nguồn"), "Mỗi ý trả lời đều dẫn về đoạn và trang trong tài liệu."),
-        h("div", { class: "feature" }, h("b", {}, "Suy luận từng bước"), "Xem bằng chứng và lập luận phía sau câu trả lời."),
-        h("div", { class: "feature" }, h("b", {}, "Kiểm chứng tự động"), "Trích dẫn không khớp tài liệu bị đánh dấu và hạ độ tin cậy.")
+      h("div", { class: "mode-intro" },
+        h("p", { class: "mode-intro-title" }, "Chọn phương pháp trả lời"),
+        h("div", { class: "mode-list" }, MODE_ORDER.map(modeRow)),
+        modeRow("compare")
       )
     );
   }
@@ -364,7 +499,7 @@
       sub = "Đang tải lên… " + (msg.progress || 0) + "%";
       progress = h("div", { class: "progress" }, h("span", { style: "width:" + (msg.progress || 0) + "%" }));
     } else if (msg.status === "processing") {
-      sub = "Đang đọc PDF và tạo embedding…";
+      sub = "Đang đọc PDF và chuẩn bị tìm kiếm…";
       progress = h("div", { class: "progress indeterminate" }, h("span", {}));
     } else if (msg.status === "ready") {
       var meta = msg.meta || {};
@@ -427,114 +562,189 @@
     });
   }
 
+  // ------------------------------------------------------------------ câu trả lời
   function renderAssistantMessage(msg) {
-    var body;
-    if (msg.status === "pending") {
-      body = renderLiveStatus(msg);
-    } else if (msg.status === "error") {
-      body = h("div", { class: "error-box" }, msg.error || "Đã xảy ra lỗi.");
-    } else {
-      body = renderResult(msg);
-    }
+    if (msg.modes.length > 1) return renderCompareMessage(msg);
+
+    var mode = msg.modes[0];
+    var run = msg.runs[mode] || {};
     return h("div", { class: "msg assistant" + (state.cite.msgId === msg.id ? " citing" : "") },
       h("div", { class: "avatar", html: ICONS.logo }),
-      h("div", { class: "assistant-body" }, body)
+      h("div", { class: "assistant-body" },
+        h("div", { class: "mode-header" }, modeTag(mode)),
+        renderRunBody(msg, mode, run, false)
+      )
     );
   }
 
+  function renderRunBody(msg, mode, run, compact) {
+    if (run.status === "waiting") return h("p", { class: "mode-waiting" }, "Đang chờ tới lượt…");
+    if (run.status === "pending") return renderLiveStatus(run);
+    if (run.status === "error") return h("div", { class: "error-box" }, run.error || "Đã xảy ra lỗi.");
+    return renderResult(msg, mode, run, compact);
+  }
+
   /** Thời gian đã trôi qua của một bước (giây), tính theo đồng hồ trình duyệt. */
-  function stageSeconds(msg, key) {
-    var times = msg.stageTimes && msg.stageTimes[key];
+  function stageSeconds(run, key) {
+    var times = run.stageTimes && run.stageTimes[key];
     if (!times) return null;
     return ((times.end || Date.now()) - times.start) / 1000;
   }
 
-  function renderLiveStatus(msg) {
-    var started = msg.stageTimes && Object.keys(msg.stageTimes).length > 0;
+  function renderLiveStatus(run) {
     var list = null;
-    if (started) {
-      list = h("ol", { class: "stage-list" }, STAGES.map(function (stage) {
-        var times = msg.stageTimes[stage.key];
-        var state = !times ? "waiting" : times.end ? "done" : "active";
-        var icon = state === "done" ? h("span", { class: "stage-icon", html: ICONS.check })
-          : state === "active" ? h("span", { class: "stage-icon" }, h("span", { class: "spinner" }))
+    if (run.stages && run.stages.length && run.stageTimes) {
+      list = h("ol", { class: "stage-list" }, run.stages.map(function (stage) {
+        var times = run.stageTimes[stage.key];
+        var status = !times ? "waiting" : times.end ? "done" : "active";
+        var icon = status === "done" ? h("span", { class: "stage-icon", html: ICONS.check })
+          : status === "active" ? h("span", { class: "stage-icon" }, h("span", { class: "spinner" }))
           : h("span", { class: "stage-icon" }, "○");
-        return h("li", { class: state, "data-stage": stage.key },
+        return h("li", { class: status, "data-stage": stage.key },
           icon,
           h("span", {}, stage.label),
-          h("span", { class: "stage-time" }, times ? formatSeconds(stageSeconds(msg, stage.key)) : "")
+          h("span", { class: "stage-time" }, times ? formatSeconds(stageSeconds(run, stage.key)) : "")
         );
       }));
     }
     return h("div", { class: "live-box" },
       h("div", { class: "live-head" },
         h("span", { class: "pulse" }),
-        h("span", { class: "shimmer" }, (msg.stage || "Đang xử lý") + "…"),
-        h("span", { class: "live-total", title: "Thời gian phản hồi" }, formatSeconds((Date.now() - msg.startedAt) / 1000))
+        h("span", { class: "shimmer" }, (run.stage || "Đang xử lý") + "…"),
+        h("span", { class: "live-total", title: "Thời gian phản hồi" }, formatSeconds((Date.now() - run.startedAt) / 1000))
       ),
       list
     );
   }
 
   /** Cập nhật đồng hồ tại chỗ (không vẽ lại cả tin nhắn để hiệu ứng không bị giật). */
-  function tickPending(msg) {
+  function tick(msg) {
     var node = els.inner.querySelector('[data-id="' + msg.id + '"]');
     if (!node) return;
-    var total = node.querySelector(".live-total");
+    var total = node.querySelector(".compare-live-total");
     if (total) total.textContent = formatSeconds((Date.now() - msg.startedAt) / 1000);
-    if (msg.activeStage) {
-      var cell = node.querySelector('.stage-list li[data-stage="' + msg.activeStage + '"] .stage-time');
-      if (cell) cell.textContent = formatSeconds(stageSeconds(msg, msg.activeStage));
-    }
+    msg.modes.forEach(function (mode) {
+      var run = msg.runs[mode];
+      if (!run || run.status !== "pending") return;
+      var scope = msg.modes.length > 1 ? node.querySelector('.mode-card[data-mode="' + mode + '"]') : node;
+      if (!scope) return;
+      var live = scope.querySelector(".live-total");
+      if (live) live.textContent = formatSeconds((Date.now() - run.startedAt) / 1000);
+      if (run.activeStage) {
+        var cell = scope.querySelector('.stage-list li[data-stage="' + run.activeStage + '"] .stage-time');
+        if (cell) cell.textContent = formatSeconds(stageSeconds(run, run.activeStage));
+      }
+    });
   }
 
   /** Tổng thời gian phản hồi người dùng thấy (giây). */
-  function responseSeconds(msg) {
-    if (msg.totalSeconds) return msg.totalSeconds;
-    return msg.duration || null; // tin nhắn cũ chỉ lưu số giây làm tròn
+  function responseSeconds(run) {
+    return (run && (run.totalSeconds || run.duration)) || null;
   }
 
-  function renderResult(msg) {
-    var result = msg.result || {};
+  function metricChip(icon, text, title) {
+    return h("span", { class: "metric-chip", title: title || null }, icon ? h("span", { html: icon }) : null, text);
+  }
+
+  /** Các chỉ số dùng để đánh giá: thời gian, số lần gọi LLM, token, số đoạn, model, độ tin cậy, trích dẫn khớp. */
+  function renderMetrics(mode, run, result) {
+    var row = h("div", { class: "metrics" });
+    var total = responseSeconds(run);
+    var usage = result.usage || {};
     var sources = result.sources || [];
-    var isDocument = result.category === "document" && sources.length > 0;
+
+    if (total) row.append(metricChip(ICONS.clock, formatSeconds(total), timingTooltip(run, result)));
+    if (usage.llm_calls) row.append(metricChip(null, usage.llm_calls + " lần gọi LLM"));
+    if (usage.prompt_tokens || usage.completion_tokens) {
+      row.append(metricChip(null, formatNumber(usage.prompt_tokens + usage.completion_tokens) + " token",
+        "Token vào: " + formatNumber(usage.prompt_tokens) + " · Token ra: " + formatNumber(usage.completion_tokens)));
+    }
+    if (mode !== "llm") row.append(metricChip(null, sources.length ? sources.length + " đoạn tài liệu" : "Không có đoạn tài liệu"));
+    if (result.models && result.models.length) {
+      row.append(metricChip(null, result.models.map(shortModel).join(", "), "Model đã trả lời"));
+    }
+    if (mode === "reasoning" && result.confidence) {
+      row.append(h("span", { class: "badge " + (CONFIDENCE_CLASS[result.confidence] || "thap") }, "Độ tin cậy: " + result.confidence));
+    }
+    if (mode === "reasoning" && result.evidence && result.evidence.length) {
+      var verified = result.evidence.filter(function (item) { return item.verified; }).length;
+      row.append(metricChip(null, "Trích dẫn khớp " + verified + "/" + result.evidence.length,
+        "Số câu trích dẫn khớp nguyên văn tài liệu / tổng số câu trích dẫn"));
+    }
+    return row;
+  }
+
+  function renderRating(msg, mode, run) {
+    var row = h("div", { class: "rating" }, h("span", { class: "rating-label" }, "Đánh giá:"));
+    RATINGS.forEach(function (rating) {
+      var active = run.rating === rating.key;
+      row.append(h("button", {
+        type: "button", class: "rate-btn " + rating.key + (active ? " active" : ""), "aria-pressed": active ? "true" : "false",
+        onclick: function () {
+          run.rating = active ? null : rating.key;
+          saveConversations();
+          updateMessage(msg);
+        }
+      }, rating.icon + " " + rating.label));
+    });
+    return row;
+  }
+
+  function ratingLabel(key) {
+    var found = RATINGS.filter(function (rating) { return rating.key === key; })[0];
+    return found ? found.label : "";
+  }
+
+  function renderResult(msg, mode, run, compact) {
+    var result = run.result || {};
+    var sources = result.sources || [];
     var parts = [];
-    var total = responseSeconds(msg);
 
-    if (isDocument) parts.push(renderThinking(msg, result));
+    if (mode === "reasoning" && result.category === "document" && sources.length) parts.push(renderThinking(run, result));
 
-    parts.push(h("div", { class: "markdown", html: renderMarkdown(result.answer || "", sources.length) }));
-
-    var meta = h("div", { class: "answer-meta" });
-    if (total) {
-      meta.append(h("span", { class: "time-chip", title: timingTooltip(msg, result) },
-        h("span", { html: ICONS.clock }), formatSeconds(total)));
+    var answer = result.answer || "";
+    parts.push(h("div", {
+      class: "markdown" + (compact && !run.expanded && answer.length > 600 ? " clamped" : ""),
+      html: renderMarkdown(answer, sources.length)
+    }));
+    if (compact && answer.length > 600) {
+      parts.push(h("button", {
+        type: "button", class: "expand-btn",
+        onclick: function () {
+          run.expanded = !run.expanded;
+          saveConversations();
+          updateMessage(msg);
+        }
+      }, run.expanded ? "Thu gọn ▴" : "Xem đầy đủ ▾"));
     }
-    if (isDocument && result.confidence) {
-      meta.append(h("span", { class: "badge " + (CONFIDENCE_CLASS[result.confidence] || "thap") }, "Độ tin cậy: " + result.confidence));
+
+    parts.push(renderMetrics(mode, run, result));
+    if (result.pipeline && result.pipeline.length) {
+      parts.push(h("p", { class: "pipeline" }, "Quy trình: " + result.pipeline.join(" → ")));
     }
-    if (isDocument) {
-      meta.append(h("button", {
+    if (result.warnings && result.warnings.length) {
+      parts.push(h("div", { class: "warnings" }, result.warnings.map(function (w) { return h("p", {}, "⚠ " + w); })));
+    }
+
+    var actions = h("div", { class: "answer-meta" });
+    if (sources.length) {
+      actions.append(h("button", {
         class: "ghost-btn view-sources", type: "button", html: ICONS.quote + "<span>Văn bản gốc (" + sources.length + ")</span>",
-        onclick: function () { openCitePanel(msg.id, null); }
+        onclick: function () { openCitePanel(msg.id, null, mode); }
       }));
     }
     var copyBtn = h("button", { class: "ghost-btn", type: "button", html: ICONS.copy + "<span>Sao chép</span>" });
     copyBtn.addEventListener("click", function () {
       if (!navigator.clipboard) return;
-      navigator.clipboard.writeText(result.answer || "").then(function () {
+      navigator.clipboard.writeText(answer).then(function () {
         copyBtn.lastChild.textContent = "Đã chép";
         setTimeout(function () { copyBtn.lastChild.textContent = "Sao chép"; }, 1500);
       });
     });
-    meta.append(copyBtn);
-    parts.push(meta);
+    actions.append(copyBtn);
+    parts.push(actions);
 
-    if (result.warnings && result.warnings.length) {
-      parts.push(h("div", { class: "warnings" }, result.warnings.map(function (w) { return h("p", {}, "⚠ " + w); })));
-    }
-
-    if (isDocument) {
+    if (!compact && sources.length) {
       parts.push(h("div", { class: "source-row" },
         h("span", { class: "source-row-label" }, "Nguồn:"),
         sources.map(function (src) {
@@ -545,6 +755,8 @@
         })
       ));
     }
+
+    parts.push(renderRating(msg, mode, run));
     return parts;
   }
 
@@ -557,24 +769,24 @@
     return truncate(name, 28);
   }
 
-  function timingRows(msg, result) {
+  function timingRows(run, result) {
     var timings = result.timings || {};
-    var rows = STAGES.filter(function (stage) { return timings[stage.key] !== undefined; }).map(function (stage) {
-      return [stage.label, timings[stage.key]];
+    var rows = STAGE_ORDER.filter(function (key) { return timings[key] !== undefined; }).map(function (key) {
+      return [STAGE_LABELS[key], timings[key]];
     });
-    var total = responseSeconds(msg);
+    var total = responseSeconds(run);
     if (timings.total !== undefined && total && total > timings.total) {
       rows.push(["Mạng & hiển thị", total - timings.total]);
     }
     return rows;
   }
 
-  function timingTooltip(msg, result) {
-    return timingRows(msg, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); }).join("\n");
+  function timingTooltip(run, result) {
+    return timingRows(run, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); }).join("\n");
   }
 
-  function renderThinking(msg, result) {
-    var total = responseSeconds(msg);
+  function renderThinking(run, result) {
+    var total = responseSeconds(run);
     var label = total ? "Đã suy luận trong " + formatSeconds(total).replace(" s", " giây") : "Quá trình suy luận";
     var body = h("div", { class: "thinking-body" });
 
@@ -600,7 +812,7 @@
         })));
     }
 
-    var rows = timingRows(msg, result);
+    var rows = timingRows(run, result);
     if (rows.length) {
       var table = h("dl", { class: "timing-table" });
       rows.forEach(function (row) { table.append(h("dt", {}, row[0]), h("dd", {}, formatSeconds(row[1]))); });
@@ -610,18 +822,146 @@
     return h("details", { class: "thinking", "data-key": "thinking" }, h("summary", {}, label), body);
   }
 
-  // ------------------------------------------------------------------ ask
+  // ------------------------------------------------------------------ so sánh 4 phương pháp
+  function renderCompareMessage(msg) {
+    var done = msg.status === "done";
+    var head = h("div", { class: "compare-head" },
+      h("span", { class: "compare-title" }, "So sánh 4 phương pháp"),
+      done && msg.totalSeconds
+        ? metricChip(ICONS.clock, "Tổng " + formatSeconds(msg.totalSeconds))
+        : h("span", { class: "live-total compare-live-total" }, formatSeconds((Date.now() - msg.startedAt) / 1000))
+    );
+
+    var grid = h("div", { class: "compare-grid" }, msg.modes.map(function (mode) {
+      var run = msg.runs[mode] || { status: "waiting" };
+      var citing = state.cite.msgId === msg.id && state.cite.mode === mode;
+      return h("section", { class: "mode-card " + (run.status || "waiting") + (citing ? " citing" : ""), "data-mode": mode },
+        h("header", { class: "mode-card-head" }, modeTag(mode)),
+        h("div", { class: "mode-card-body" }, renderRunBody(msg, mode, run, true))
+      );
+    }));
+
+    return h("div", { class: "msg assistant compare" },
+      h("div", { class: "avatar", html: ICONS.logo }),
+      h("div", { class: "assistant-body" }, head, grid, done ? renderCompareSummary(msg) : null)
+    );
+  }
+
+  function renderCompareSummary(msg) {
+    var headers = ["Phương pháp", "Thời gian", "Gọi LLM", "Token", "Đoạn tài liệu", "Model", "Độ tin cậy", "Đánh giá"];
+    var models = {};
+
+    var rows = msg.modes.map(function (mode) {
+      var run = msg.runs[mode] || {};
+      var result = run.result || {};
+      var usage = result.usage || {};
+      (result.models || []).forEach(function (name) { models[name] = true; });
+      var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+      return h("tr", { class: run.rating ? "rated-" + run.rating : null },
+        h("td", {}, modeTag(mode, true)),
+        h("td", {}, run.status === "done" ? formatSeconds(responseSeconds(run)) : run.status === "error" ? "Lỗi" : "—"),
+        h("td", {}, usage.llm_calls || "—"),
+        h("td", {}, tokens ? formatNumber(tokens) : "—"),
+        h("td", {}, mode === "llm" ? "Không dùng" : result.sources ? String(result.sources.length) : "—"),
+        h("td", {}, (result.models || []).map(shortModel).join(", ") || "—"),
+        h("td", {}, mode === "reasoning" && result.confidence ? result.confidence : "—"),
+        h("td", { class: "rating-cell" }, ratingLabel(run.rating) || "chưa chấm")
+      );
+    });
+
+    var warning = Object.keys(models).length > 1
+      ? h("p", { class: "compare-warning" },
+        "⚠ Các phương pháp dùng model khác nhau (Groq tự chuyển model khi một model hết quota), nên so sánh chất lượng có thể chưa hoàn toàn công bằng.")
+      : null;
+
+    return h("div", { class: "compare-summary" },
+      h("div", { class: "table-wrap" },
+        h("table", { class: "compare-table" },
+          h("thead", {}, h("tr", {}, headers.map(function (text) { return h("th", {}, text); }))),
+          h("tbody", {}, rows)
+        )
+      ),
+      warning,
+      h("p", { class: "compare-hint" }, "Chấm Đúng / Một phần / Sai ở từng phương pháp, rồi bấm \"Xuất đánh giá\" ở góc trên để tải bảng CSV.")
+    );
+  }
+
+  // ------------------------------------------------------------------ hỏi
   function buildHistory(conv) {
     var turns = [];
     var question = null;
     conv.messages.forEach(function (msg) {
-      if (msg.role === "user") question = msg.text;
-      else if (msg.role === "assistant" && msg.status === "done" && question && msg.result) {
-        turns.push({ question: question.slice(0, 4000), answer: String(msg.result.answer || "").slice(0, 8000) });
+      if (msg.role === "user") {
+        question = msg.text;
+        return;
+      }
+      if (msg.role !== "assistant" || !question || !msg.runs) return;
+      // Ưu tiên câu trả lời của phương pháp 04 làm ngữ cảnh cho câu hỏi tiếp theo
+      var run = msg.runs.reasoning && msg.runs.reasoning.status === "done" ? msg.runs.reasoning : null;
+      if (!run) {
+        run = msg.modes.map(function (mode) { return msg.runs[mode]; })
+          .filter(function (item) { return item && item.status === "done" && item.result; })[0];
+      }
+      if (run && run.result) {
+        turns.push({ question: question.slice(0, 4000), answer: String(run.result.answer || "").slice(0, 8000) });
         question = null;
       }
     });
     return turns.slice(-HISTORY_TURNS);
+  }
+
+  function closeStage(run) {
+    if (run.activeStage && run.stageTimes && run.stageTimes[run.activeStage]) {
+      run.stageTimes[run.activeStage].end = Date.now();
+    }
+    run.activeStage = null;
+  }
+
+  function failUnfinished(msg, message) {
+    msg.modes.forEach(function (mode) {
+      var run = msg.runs[mode];
+      if (run && run.status !== "done" && run.status !== "error") {
+        closeStage(run);
+        run.status = "error";
+        run.error = message;
+      }
+    });
+  }
+
+  function handleEvent(msg, event) {
+    var key = event.mode || (msg.modes.length === 1 ? msg.modes[0] : null);
+    var run = key ? msg.runs[key] : null;
+    var now = Date.now();
+
+    if (event.type === "start" && run) {
+      run.status = "pending";
+      run.stages = event.stages || [];
+      run.stageTimes = {};
+      run.activeStage = null;
+      run.stage = "Bắt đầu";
+      if (msg.modes.length > 1) run.startedAt = now;
+    } else if (event.type === "status" && run) {
+      closeStage(run);
+      run.stageTimes = run.stageTimes || {};
+      run.activeStage = event.stage;
+      run.stageTimes[event.stage] = { start: now, end: null };
+      run.stage = event.message;
+    } else if (event.type === "result" && run) {
+      closeStage(run);
+      run.status = "done";
+      run.result = event;
+      run.totalSeconds = Math.round(now - run.startedAt) / 1000;
+    } else if (event.type === "error") {
+      if (run) {
+        closeStage(run);
+        run.status = "error";
+        run.error = event.message;
+        run.totalSeconds = Math.round(now - run.startedAt) / 1000;
+      } else {
+        failUnfinished(msg, event.message);
+      }
+    }
+    updateMessage(msg);
   }
 
   async function submitQuestion(text) {
@@ -629,6 +969,7 @@
     if (!text || state.busy) return;
 
     var conv = ensureConversation();
+    var mode = state.mode;
     state.busy = true;
     els.input.value = "";
     autosize();
@@ -636,59 +977,44 @@
 
     var pending = Object.keys(state.uploads).map(function (key) { return state.uploads[key]; });
     var history = buildHistory(conv);
-    var userMsg = { id: newId(), role: "user", text: text };
+    var startedAt = Date.now();
+    var waitingText = pending.length ? "Đang chờ xử lý xong tài liệu" : "Đang gửi câu hỏi";
     var botMsg = {
-      id: newId(), role: "assistant", status: "pending", startedAt: Date.now(),
-      stage: pending.length ? "Đang chờ xử lý xong tài liệu" : "Đang gửi câu hỏi"
+      id: newId(), role: "assistant", mode: mode, status: "pending", startedAt: startedAt,
+      modes: mode === "compare" ? MODE_ORDER.slice() : [mode], runs: {}
     };
-    conv.messages.push(userMsg, botMsg);
+    botMsg.modes.forEach(function (item) {
+      botMsg.runs[item] = { status: mode === "compare" ? "waiting" : "pending", stage: waitingText, startedAt: startedAt };
+    });
+    conv.messages.push({ id: newId(), role: "user", text: text }, botMsg);
     if (conv.title === DEFAULT_TITLE) conv.title = truncate(text, 48);
     touch(conv);
     if (conv.id === state.currentId) renderMessages();
 
     // Đồng hồ thời gian phản hồi: cập nhật mỗi 0,1 giây
-    var ticker = setInterval(function () { tickPending(botMsg); }, 100);
-    var closeStage = function () {
-      if (botMsg.activeStage) botMsg.stageTimes[botMsg.activeStage].end = Date.now();
-      botMsg.activeStage = null;
-    };
+    var ticker = setInterval(function () { tick(botMsg); }, 100);
     try {
       if (pending.length) {
         await Promise.all(pending);
-        botMsg.stage = "Đang gửi câu hỏi";
         botMsg.startedAt = Date.now();
+        botMsg.modes.forEach(function (item) {
+          botMsg.runs[item].startedAt = botMsg.startedAt;
+          botMsg.runs[item].stage = "Đang gửi câu hỏi";
+        });
         updateMessage(botMsg);
       }
-      botMsg.stageTimes = {};
-      await streamAsk(conv.id, text, history, function (event) {
-        if (event.type === "status") {
-          closeStage();
-          botMsg.activeStage = event.stage;
-          botMsg.stageTimes[event.stage] = { start: Date.now(), end: null };
-          botMsg.stage = event.message;
-          updateMessage(botMsg);
-        } else if (event.type === "result") {
-          closeStage();
-          botMsg.status = "done";
-          botMsg.result = event;
-        } else if (event.type === "error") {
-          closeStage();
-          botMsg.status = "error";
-          botMsg.error = event.message;
-        }
-      });
-      if (botMsg.status === "pending") {
-        botMsg.status = "error";
-        botMsg.error = "Server không trả về kết quả (có thể đã quá thời gian xử lý).";
-      }
+      await streamAsk(conv.id, text, history, mode, function (event) { handleEvent(botMsg, event); });
+      failUnfinished(botMsg, "Server không trả về kết quả (có thể đã quá thời gian xử lý).");
     } catch (err) {
-      botMsg.status = "error";
-      botMsg.error = err && err.message ? err.message : String(err);
+      failUnfinished(botMsg, err && err.message ? err.message : String(err));
     } finally {
       clearInterval(ticker);
+      botMsg.status = "done";
       botMsg.totalSeconds = Math.round(Date.now() - botMsg.startedAt) / 1000;
-      delete botMsg.stageTimes;
-      delete botMsg.activeStage;
+      botMsg.modes.forEach(function (item) {
+        delete botMsg.runs[item].stageTimes;
+        delete botMsg.runs[item].activeStage;
+      });
       state.busy = false;
       touch(conv);
       updateMessage(botMsg);
@@ -696,12 +1022,80 @@
       scrollToBottom();
     }
 
-    // Màn hình rộng: tự mở hộp trích dẫn văn bản gốc cạnh câu trả lời
-    var result = botMsg.result;
-    if (botMsg.status === "done" && result && result.sources && result.sources.length &&
+    // Màn hình rộng: tự mở hộp trích dẫn văn bản gốc cạnh câu trả lời (khi chỉ chạy một phương pháp)
+    var single = botMsg.modes.length === 1 ? botMsg.runs[botMsg.modes[0]] : null;
+    if (single && single.status === "done" && single.result && single.result.sources && single.result.sources.length &&
         conv.id === state.currentId && window.innerWidth >= WIDE_SCREEN) {
-      openCitePanel(botMsg.id, null);
+      openCitePanel(botMsg.id, null, botMsg.modes[0]);
     }
+  }
+
+  // ------------------------------------------------------------------ xuất bảng đánh giá
+  function csvCell(value) {
+    var text = value === null || value === undefined ? "" : String(value);
+    return /[",\r\n;]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  }
+
+  function slugify(text) {
+    var slug = String(text || "").normalize("NFD").replace(/[̀-ͯ]/g, "")
+      .replace(/đ/g, "d").replace(/Đ/g, "D")
+      .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 40);
+    return slug || "cuoc-tro-chuyen";
+  }
+
+  function exportEvaluation() {
+    var conv = current();
+    var rows = [[
+      "STT", "Câu hỏi", "Phương pháp", "Thời gian (giây)", "Số lần gọi LLM", "Token vào", "Token ra",
+      "Số đoạn tài liệu", "Model", "Độ tin cậy", "Trích dẫn khớp", "Đánh giá", "Câu trả lời"
+    ]];
+    var question = "";
+    var number = 0;
+
+    (conv ? conv.messages : []).forEach(function (msg) {
+      if (msg.role === "user") {
+        question = msg.text;
+        return;
+      }
+      if (msg.role !== "assistant" || !msg.runs) return;
+      number += 1;
+      msg.modes.forEach(function (mode) {
+        var run = msg.runs[mode];
+        if (!run) return;
+        var result = run.result || {};
+        var usage = result.usage || {};
+        var evidence = result.evidence || [];
+        var verified = evidence.filter(function (item) { return item.verified; }).length;
+        rows.push([
+          number,
+          question,
+          MODES[mode].num + " " + MODES[mode].title,
+          run.status === "done" && responseSeconds(run) ? responseSeconds(run).toFixed(2) : "",
+          usage.llm_calls || "",
+          usage.prompt_tokens || "",
+          usage.completion_tokens || "",
+          mode === "llm" ? 0 : (result.sources ? result.sources.length : ""),
+          (result.models || []).map(shortModel).join(", "),
+          mode === "reasoning" ? (result.confidence || "") : "",
+          evidence.length ? verified + "/" + evidence.length : "",
+          ratingLabel(run.rating),
+          run.status === "error" ? "LỖI: " + (run.error || "") : (result.answer || "")
+        ]);
+      });
+    });
+
+    if (rows.length === 1) {
+      alert("Cuộc trò chuyện này chưa có câu trả lời nào để xuất.");
+      return;
+    }
+    // BOM để Excel đọc đúng tiếng Việt
+    var csv = "﻿" + rows.map(function (row) { return row.map(csvCell).join(","); }).join("\r\n");
+    var url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    var link = h("a", { href: url, download: "danh-gia-" + slugify(conv.title) + ".csv" });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   }
 
   // ------------------------------------------------------------------ upload
@@ -808,6 +1202,11 @@
     return null;
   }
 
+  function runOf(msg, mode) {
+    if (!msg || !msg.runs) return null;
+    return msg.runs[mode || msg.modes[0]] || null;
+  }
+
   /** Các đoạn [n] được câu trả lời trích dẫn hoặc dùng làm bằng chứng. */
   function citedIndexes(result) {
     var cited = {};
@@ -852,22 +1251,26 @@
 
   function renderCitePanel() {
     var msg = findMessage(state.cite.msgId);
-    if (!msg || !msg.result) {
+    var mode = state.cite.mode || (msg && msg.modes ? msg.modes[0] : null);
+    var run = runOf(msg, mode);
+    if (!run || !run.result) {
       closeCitePanel();
       return;
     }
-    var result = msg.result;
+    var result = run.result;
     var sources = result.sources || [];
+    var reasoning = mode === "reasoning";
     var cited = citedIndexes(result);
-    var total = responseSeconds(msg);
+    var total = responseSeconds(run);
 
     els.citeQuestion.textContent = "Câu hỏi: " + (result.question || "");
     els.citeMeta.textContent = "";
+    els.citeMeta.append(modeTag(mode, true));
     if (total) {
-      els.citeMeta.append(h("span", { class: "time-chip", title: timingTooltip(msg, result) },
-        h("span", { html: ICONS.clock }), "Phản hồi trong " + formatSeconds(total)));
+      els.citeMeta.append(h("span", { class: "time-chip", title: timingTooltip(run, result) },
+        h("span", { html: ICONS.clock }), formatSeconds(total)));
     }
-    if (result.confidence) {
+    if (reasoning && result.confidence) {
       els.citeMeta.append(h("span", { class: "badge " + (CONFIDENCE_CLASS[result.confidence] || "thap") }, "Độ tin cậy: " + result.confidence));
     }
     els.citeMeta.append(h("span", { class: "time-chip" }, sources.length + " đoạn trích"));
@@ -888,14 +1291,25 @@
         }
       });
 
-      var used = !!cited[src.index];
+      // 04: phân biệt đoạn được dùng / không dùng; 02, 03: mọi đoạn đều được đưa cho LLM
+      var used = reasoning ? !!cited[src.index] : true;
+      var tag = reasoning
+        ? (used ? "Được dùng trong câu trả lời" : "Tìm thấy nhưng không dùng trong câu trả lời")
+        : "Đưa cho LLM làm ngữ cảnh";
+      var hasRerank = src.rerank_score !== null && src.rerank_score !== undefined;
+      var scoreText = hasRerank
+        ? "rerank " + Number(src.rerank_score).toFixed(1) + "/10 · trước #" + src.initial_rank
+        : Number(src.score).toFixed(2);
       var pdfUrl = src.doc_id ? api("/documents/" + src.doc_id + "/file") + (src.page_number ? "#page=" + src.page_number : "") : null;
 
       els.citeBody.append(h("article", { class: "cite-card " + (used ? "cited" : "unused"), "data-index": src.index },
         h("div", { class: "cite-card-head" },
           h("span", { class: "source-index" }, src.index),
           h("span", { class: "cite-card-label", title: src.label }, src.label),
-          h("span", { class: "cite-card-score", title: "Độ liên quan (cosine)" }, Number(src.score).toFixed(2)),
+          h("span", {
+            class: "cite-card-score",
+            title: hasRerank ? "Điểm LLM chấm khi xếp hạng lại / thứ hạng trước khi xếp hạng lại" : "Độ liên quan khi tìm kiếm"
+          }, scoreText),
           pdfUrl ? h("a", {
             class: "cite-card-open", href: pdfUrl, target: "_blank", rel: "noopener",
             title: "Mở PDF tại trang này", "aria-label": "Mở PDF tại trang này", html: ICONS.open
@@ -903,8 +1317,7 @@
         ),
         h("p", { class: "cite-card-text" }, highlightText(text, ranges)),
         h("div", { class: "cite-card-foot" },
-          h("span", { class: "cite-tag" + (used ? " used" : "") },
-            used ? "Được dùng trong câu trả lời" : "Tìm thấy nhưng không dùng trong câu trả lời"),
+          h("span", { class: "cite-tag" + (used ? " used" : "") }, tag),
           notes
         )
       ));
@@ -930,12 +1343,19 @@
 
   function markCitingMessage() {
     Array.prototype.forEach.call(els.inner.querySelectorAll(".msg.assistant"), function (node) {
-      node.classList.toggle("citing", !!state.cite.msgId && node.getAttribute("data-id") === state.cite.msgId);
+      var id = node.getAttribute("data-id");
+      var selected = !!state.cite.msgId && id === state.cite.msgId;
+      node.classList.toggle("citing", selected && !node.classList.contains("compare"));
+      Array.prototype.forEach.call(node.querySelectorAll(".mode-card"), function (card) {
+        card.classList.toggle("citing", selected && card.getAttribute("data-mode") === state.cite.mode);
+      });
     });
   }
 
-  function openCitePanel(msgId, focus) {
+  function openCitePanel(msgId, focus, mode) {
+    var msg = findMessage(msgId);
     state.cite.msgId = msgId;
+    state.cite.mode = mode || (msg && msg.modes ? msg.modes[0] : null);
     renderCitePanel();
     if (!state.cite.msgId) return;
     els.citePanel.hidden = false;
@@ -946,6 +1366,7 @@
 
   function closeCitePanel() {
     state.cite.msgId = null;
+    state.cite.mode = null;
     els.citePanel.hidden = true;
     els.app.classList.remove("cite-open");
     markCitingMessage();
@@ -1044,7 +1465,7 @@
       var data = await response.json();
       state.config = data;
       var storage = data.storage === "vercel-blob" ? "Vercel Blob" : data.storage === "local" ? "thư mục dataset_web/" : "chưa sẵn sàng";
-      var providers = (data.llm_providers || []).map(function (name) { return name.replace(/^groq\//, ""); }).join(" → ") || "chưa cấu hình";
+      var providers = (data.llm_providers || []).map(shortModel).join(" → ") || "chưa cấu hình";
       var search = data.embedding_model ? "từ khoá + ngữ nghĩa (" + data.embedding_model + ")" : "từ khoá (BM25)";
       els.serverStatus.innerHTML =
         "<strong>Model:</strong> " + escapeHtml(providers) +
@@ -1079,6 +1500,14 @@
       }
     });
 
+    els.modeBtn.addEventListener("click", function () {
+      if (els.modeMenu.hidden) openModeMenu();
+      else closeModeMenu();
+    });
+    document.addEventListener("click", function (event) {
+      if (!els.modeMenu.hidden && !els.modePicker.contains(event.target)) closeModeMenu();
+    });
+
     els.attachBtn.addEventListener("click", function () { els.fileInput.click(); });
     els.docsUpload.addEventListener("click", function () { els.fileInput.click(); });
     els.fileInput.addEventListener("change", function () {
@@ -1086,17 +1515,23 @@
       els.fileInput.value = "";
     });
 
+    els.exportBtn.addEventListener("click", exportEvaluation);
     els.docsBtn.addEventListener("click", function () {
       els.docsPanel.hidden = !els.docsPanel.hidden;
       if (!els.docsPanel.hidden) refreshDocs();
     });
     els.closeDocs.addEventListener("click", function () { els.docsPanel.hidden = true; });
 
-    // Bấm chip [n] hoặc chip nguồn -> mở hộp văn bản gốc tại đoạn tương ứng
+    // Bấm chip [n] hoặc chip nguồn -> mở hộp văn bản gốc tại đoạn tương ứng (đúng phương pháp)
     els.inner.addEventListener("click", function (event) {
       var trigger = event.target.closest(".cite, .src-chip");
       if (!trigger) return;
-      openCitePanel(trigger.closest(".msg").getAttribute("data-id"), trigger.getAttribute("data-cite"));
+      var card = trigger.closest(".mode-card");
+      openCitePanel(
+        trigger.closest(".msg").getAttribute("data-id"),
+        trigger.getAttribute("data-cite"),
+        card ? card.getAttribute("data-mode") : null
+      );
     });
     els.closeCite.addEventListener("click", closeCitePanel);
 
@@ -1135,7 +1570,8 @@
 
     document.addEventListener("keydown", function (event) {
       if (event.key === "Escape") {
-        if (!els.docsPanel.hidden) els.docsPanel.hidden = true;
+        if (!els.modeMenu.hidden) closeModeMenu();
+        else if (!els.docsPanel.hidden) els.docsPanel.hidden = true;
         else if (state.cite.msgId) closeCitePanel();
         closeSidebarMobile();
       }
@@ -1144,17 +1580,24 @@
 
   // ------------------------------------------------------------------ init
   function init() {
-    // Upload / câu hỏi bị gián đoạn do tải lại trang
     state.conversations.forEach(function (conv) {
       conv.messages.forEach(function (msg) {
+        normalizeAssistant(msg);
+        // Upload / câu hỏi bị gián đoạn do tải lại trang
         if (msg.role === "doc" && (msg.status === "uploading" || msg.status === "processing")) {
           msg.status = "error";
           msg.error = "Tải lên bị gián đoạn, hãy tải lại file.";
         }
         if (msg.role === "doc" && msg.overviewStatus === "loading") msg.overviewStatus = "error";
-        if (msg.role === "assistant" && msg.status === "pending") {
-          msg.status = "error";
-          msg.error = "Câu trả lời bị gián đoạn do trang được tải lại.";
+        if (msg.role === "assistant") {
+          msg.modes.forEach(function (mode) {
+            var run = msg.runs[mode];
+            if (run && (run.status === "pending" || run.status === "waiting")) {
+              run.status = "error";
+              run.error = "Câu trả lời bị gián đoạn do trang được tải lại.";
+            }
+          });
+          msg.status = "done";
         }
       });
     });
@@ -1166,6 +1609,7 @@
 
     bindEvents();
     renderThemeToggle();
+    renderModePicker();
     renderAll();
     refreshDocs();
     loadHealth();

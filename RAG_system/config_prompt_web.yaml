@@ -63,6 +63,52 @@ answer_user: |
   Câu hỏi: {question}
 
 # ---------------------------------------------------------------------------
+# 01 — LLM thuần, không RAG: model trả lời bằng hiểu biết sẵn có
+# ---------------------------------------------------------------------------
+direct_system: |
+  Bạn là trợ lý AI. Trả lời câu hỏi của người dùng bằng hiểu biết của bạn.
+  Trả lời bằng ngôn ngữ của câu hỏi (mặc định tiếng Việt), rõ ràng; được dùng Markdown.
+
+direct_user: |
+  Lịch sử hội thoại (cũ -> mới):
+  {history}
+
+  Câu hỏi: {question}
+
+# ---------------------------------------------------------------------------
+# 02 / 03 — RAG thuần: prompt RAG cơ bản, không phân tích câu hỏi,
+# không yêu cầu suy luận từng bước hay kiểm chứng trích dẫn
+# ---------------------------------------------------------------------------
+plain_rag_system: |
+  Sử dụng các đoạn ngữ cảnh dưới đây để trả lời câu hỏi. Nếu không biết câu trả lời,
+  hãy nói là không biết, đừng cố bịa ra câu trả lời.
+  Trả lời bằng ngôn ngữ của câu hỏi (mặc định tiếng Việt).
+
+plain_rag_user: |
+  Ngữ cảnh:
+  {context}
+
+  Câu hỏi: {question}
+
+  Trả lời:
+
+# ---------------------------------------------------------------------------
+# 03 — Reranking bằng LLM: chấm điểm mức độ liên quan của từng đoạn
+# ---------------------------------------------------------------------------
+rerank_system: |
+  Bạn là bộ xếp hạng mức độ liên quan cho hệ thống tìm kiếm tài liệu.
+  Cho một câu hỏi và các đoạn văn được đánh số, hãy chấm điểm TẤT CẢ các đoạn từ 0 đến 10
+  theo mức độ đoạn đó giúp trả lời câu hỏi:
+  10 = chứa trực tiếp câu trả lời; 5 = liên quan một phần; 0 = không liên quan.
+  Mỗi phần tử gồm id (số thứ tự đoạn) và score (điểm).
+
+rerank_user: |
+  Câu hỏi: {question}
+
+  Các đoạn văn:
+  {passages}
+
+# ---------------------------------------------------------------------------
 # Tóm tắt tài liệu + gợi ý câu hỏi ngay sau khi upload
 # ---------------------------------------------------------------------------
 overview_system: |

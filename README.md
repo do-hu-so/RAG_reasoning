@@ -34,6 +34,7 @@ Câu trả lời
 
 ### Tính năng
 
+- **4 phương pháp trả lời + chế độ so sánh để đánh giá** (xem mục "So sánh & đánh giá 4 phương pháp" bên dưới).
 - Giao diện chat giống ChatGPT, có thanh bên chứa các cuộc trò chuyện, chế độ sáng / tối, dùng tốt trên điện thoại.
 - Bấm 📎 hoặc kéo thả PDF vào khung chat. Hệ thống đọc file, chia đoạn (và tạo embedding nếu có Cloudflare); xong là hỏi được ngay. Có thể gõ câu hỏi trong lúc file đang xử lý, câu hỏi sẽ tự gửi khi file sẵn sàng.
 - Sau khi upload, bot tóm tắt tài liệu và gợi ý 3 câu hỏi (bấm vào để hỏi luôn).
@@ -45,6 +46,26 @@ Câu trả lời
   - Mỗi đoạn có nút mở PDF tại đúng trang.
   - Bấm chip `[n]` trong câu trả lời hoặc chip nguồn bên dưới sẽ cuộn tới đoạn tương ứng.
 - Mỗi cuộc trò chuyện chỉ trả lời dựa trên các PDF đã tải lên trong cuộc trò chuyện đó. Panel "tài liệu" cho phép mở hoặc xoá từng file.
+
+### So sánh & đánh giá 4 phương pháp
+
+Nút chọn phương pháp nằm cạnh ô nhập câu hỏi. Mặc định là **"So sánh cả 4"**: mỗi câu hỏi chạy lần lượt cả 4 phương pháp, rồi hiện 4 câu trả lời cạnh nhau để đánh giá.
+
+| | Phương pháp | Cách làm | Số lần gọi LLM |
+|---|---|---|---|
+| 01 | LLM thuần, không RAG | Hỏi thẳng LLM, không đưa tài liệu | 1 |
+| 02 | LLM + RAG thuần | Tìm `WEB_TOP_N` đoạn theo nguyên văn câu hỏi → prompt RAG cơ bản | 1 |
+| 03 | LLM + RAG + Reranking | Tìm `WEB_RERANK_CANDIDATES` đoạn ứng viên → LLM chấm điểm 0–10 từng đoạn → giữ `WEB_TOP_N` đoạn điểm cao nhất → prompt RAG cơ bản | 2 |
+| 04 | LLM + RAG + Reasoning | Phân tích & viết lại câu hỏi, tách truy vấn con → tìm đoạn → suy luận từng bước có trích dẫn → kiểm chứng trích dẫn | 2 |
+
+- Cả 4 phương pháp dùng **cùng một bộ tìm kiếm** (BM25, cộng thêm ngữ nghĩa nếu có Cloudflare), nên khác biệt giữa 02, 03 và 04 chỉ đến từ reranking và reasoning.
+- **Chỉ số hiện cho từng phương pháp:** thời gian phản hồi (kèm thời gian từng bước), số lần gọi LLM, số token vào/ra, số đoạn tài liệu, model đã trả lời. Riêng 04 có thêm độ tin cậy và số trích dẫn khớp tài liệu. Hộp "Văn bản gốc" hiện đúng các đoạn đã đưa cho LLM; với 03 có thêm điểm rerank và thứ hạng trước khi rerank.
+- **Chấm điểm thủ công:** mỗi câu trả lời có nút Đúng / Một phần / Sai. Bảng tổng hợp dưới mỗi câu hỏi gom toàn bộ chỉ số và điểm đã chấm.
+- **Xuất đánh giá:** nút "Xuất đánh giá" trên thanh tiêu đề tải file CSV của cả cuộc trò chuyện (mở được bằng Excel / Google Sheets). Mỗi dòng gồm câu hỏi, phương pháp, các chỉ số, điểm chấm và câu trả lời.
+- **Lưu ý khi so sánh:**
+  - Khi một model Groq hết quota, app tự chuyển model. Nếu trong một lần so sánh các phương pháp dùng model khác nhau, bảng tổng hợp sẽ cảnh báo, vì khi đó so sánh chất lượng chưa hoàn toàn công bằng.
+  - Bản web rerank bằng LLM, vì Vercel không chạy được cross-encoder; bản dòng lệnh dùng cross-encoder `bge-reranker-v2-m3`.
+  - Phương pháp 04 mặc định không rerank, đúng nghĩa "RAG + Reasoning". Đặt `WEB_REASONING_RERANK=1` nếu muốn 04 gồm cả reranking.
 
 ### Chạy trên máy
 
@@ -147,6 +168,8 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 | `BLOB_ACCESS` | `private` | Chế độ của Vercel Blob store |
 | `MAX_UPLOAD_MB` | `4` | Dung lượng tối đa mỗi PDF |
 | `WEB_CHUNK_SIZE` / `WEB_CHUNK_OVERLAP` / `WEB_TOP_N` | `800` / `150` / `6` | Chia đoạn và số đoạn đưa cho LLM (bản web) |
+| `WEB_RERANK_CANDIDATES` | `15` | Phương pháp 03: số đoạn ứng viên trước khi xếp hạng lại |
+| `WEB_REASONING_RERANK` | (tắt) | Đặt `1` để phương pháp 04 xếp hạng lại trước khi suy luận |
 | `EMBEDDING_MODEL` / `RERANKER_MODEL` | `BAAI/bge-m3` / `BAAI/bge-reranker-v2-m3` | Model của bản dòng lệnh |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_INITIAL_K` / `RAG_TOP_N` | `500` / `100` / `10` / `5` | Tham số của bản dòng lệnh |
 
@@ -172,7 +195,7 @@ Mã nguồn: `RAG_system/RAG/reasoning.py`. Prompt: `RAG_system/config_prompt_we
 ## 5. Kiểm thử
 
 ```powershell
-python test_web.py        # 25 test bản web: upload, hỏi–đáp stream, BM25 / hybrid, chuyển nhà cung cấp, lỗi (không cần API key)
+python test_web.py        # 35 test bản web: upload, 4 phương pháp + so sánh, rerank, BM25 / hybrid, chuyển model, lỗi (không cần API key)
 python test_offline.py    # 13 test lõi RAG + bản dòng lệnh (không cần API key / model)
 python test_simple.py     # kiểm tra nhanh file PDF và cấu trúc project
 ```
@@ -202,6 +225,7 @@ RAG_reasoning/
 │   ├── storage.py                  # Lưu trữ: thư mục dataset_web/ hoặc Vercel Blob
 │   ├── embeddings.py               # Embedding qua Cloudflare Workers AI (bge-m3)
 │   ├── keyword_search.py           # Tìm kiếm từ khoá BM25 (không tốn quota)
+│   ├── reranking.py                # Xếp hạng lại bằng LLM (phương pháp 03)
 │   └── service.py                  # Upload -> chunk -> embedding; hỏi–đáp có suy luận
 ├── RAG_system/
 │   ├── RAG/                        # Lõi RAG: reasoning, gen (Groq), settings, pipeline / ingest / reranking (CLI)

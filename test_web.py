@@ -51,6 +51,7 @@ from RAG.reasoning import ANSWER_SCHEMA, QUERY_ANALYSIS_SCHEMA
 from webapp.config import WEB_PROMPT_FILE, WebSettings
 from webapp.embeddings import CloudflareEmbedder, create_embedder
 from webapp.keyword_search import BM25, tokenize
+from webapp.reranking import RERANK_SCHEMA, LLMReranker
 from webapp.service import NO_DOCUMENT_MESSAGE, OVERVIEW_SCHEMA, WebRAGService, set_service
 from webapp.storage import LocalStorage
 
@@ -86,15 +87,32 @@ class FakeEmbedder:
 class FakeLLM:
     """LLM giả: trả lời theo schema được yêu cầu, trích nguyên văn đoạn [1] trong prompt."""
 
-    def __init__(self, category="document", fail=False):
+    def __init__(self, category="document", fail=False, fail_direct=False):
         self.category = category
         self.fail = fail
+        self.fail_direct = fail_direct
         self.calls = []
+        self.last_used = "groq/model-gia"
+        self.last_usage = {"prompt_tokens": 100, "completion_tokens": 20}
 
     def generate(self, prompt, system=None, json_schema=None, thinking_level=None):
-        self.calls.append({"prompt": prompt, "schema": json_schema})
+        self.calls.append({"prompt": prompt, "schema": json_schema, "system": system})
         if self.fail:
             raise RuntimeError("model lỗi giả lập")
+
+        if json_schema is None:
+            if "Ngữ cảnh:" in prompt:  # RAG thuần (02 / 03)
+                return "Trả lời RAG thuần từ ngữ cảnh."
+            if self.fail_direct:
+                raise RuntimeError("LLM thuần lỗi giả lập")
+            return "Trả lời trực tiếp, không dùng tài liệu."  # LLM thuần (01)
+
+        if json_schema is RERANK_SCHEMA:
+            # Chấm điểm cao nhất cho đoạn nói về "hết nhiên liệu"
+            passages = re.findall(r"^\[(\d+)\] (.*)$", prompt, re.M)
+            return json.dumps({"scores": [
+                {"id": int(number), "score": 9 if "hết nhiên liệu" in text else 2} for number, text in passages
+            ]})
 
         if json_schema is QUERY_ANALYSIS_SCHEMA:
             question = prompt.rsplit("Câu hỏi mới:", 1)[1].strip()
@@ -162,10 +180,10 @@ class WebTestCase(unittest.TestCase):
             files={"file": (filename, data, "application/pdf")},
         )
 
-    def ask(self, question, history=(), conversation=CONVERSATION):
+    def ask(self, question, history=(), conversation=CONVERSATION, mode="reasoning"):
         response = self.client.post(
             f"/api/conversations/{conversation}/ask",
-            json={"question": question, "history": [{"question": q, "answer": a} for q, a in history]},
+            json={"question": question, "history": [{"question": q, "answer": a} for q, a in history], "mode": mode},
         )
         self.assertEqual(response.status_code, 200)
         return read_events(response)
@@ -283,6 +301,109 @@ class TestAsk(WebTestCase):
 
         response = self.client.post(f"/api/conversations/{CONVERSATION}/ask", json={"question": ""})
         self.assertEqual(response.status_code, 422)
+
+
+class TestModes(WebTestCase):
+    """4 phương pháp 01–04 và chế độ so sánh."""
+
+    QUESTION = "Xe tuần tra hết nhiên liệu thì phải làm gì?"
+
+    def result_of(self, events, mode):
+        return [event for event in events if event["type"] == "result" and event["mode"] == mode][0]
+
+    def test_llm_only_does_not_use_documents(self):
+        self.upload()
+        events = self.ask(self.QUESTION, mode="llm")
+        self.assertEqual(events[0], {"type": "start", "mode": "llm", "title": "LLM thuần, không RAG",
+                                     "stages": [{"key": "generating", "label": "Sinh câu trả lời"}]})
+        result = events[-1]
+        self.assertEqual(result["answer"], "Trả lời trực tiếp, không dùng tài liệu.")
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(len(self.llm.calls), 1)
+        self.assertNotIn("Ngữ cảnh", self.llm.calls[0]["prompt"])
+        self.assertEqual(self.embedder.query_calls, 0)  # không tìm kiếm
+        self.assertEqual(result["usage"], {"llm_calls": 1, "prompt_tokens": 100, "completion_tokens": 20})
+        self.assertEqual(result["models"], ["groq/model-gia"])
+        self.assertEqual(set(result["timings"]), {"generating", "total"})
+
+    def test_plain_rag_uses_raw_question_without_analysis(self):
+        self.upload()
+        result = self.ask(self.QUESTION, mode="rag")[-1]
+        self.assertEqual(result["mode"], "rag")
+        self.assertEqual(result["answer"], "Trả lời RAG thuần từ ngữ cảnh.")
+        self.assertEqual(len(result["sources"]), self.settings.top_n)
+        self.assertEqual(len(self.llm.calls), 1)  # không có bước phân tích câu hỏi
+        self.assertIn("Ngữ cảnh:", self.llm.calls[0]["prompt"])
+        self.assertEqual(result["sub_queries"], [self.QUESTION])
+        self.assertEqual(result["evidence"], [])
+        self.assertEqual(result["confidence"], "")
+        self.assertIsNone(result["sources"][0]["rerank_score"])
+        self.assertEqual(set(result["timings"]), {"retrieving", "generating", "total"})
+
+    def test_rerank_reorders_candidates(self):
+        self.upload()
+        events = self.ask(self.QUESTION, mode="rerank")
+        stages = [event["stage"] for event in events if event["type"] == "status"]
+        self.assertEqual(stages, ["retrieving", "reranking", "generating"])
+
+        result = events[-1]
+        self.assertEqual(len(result["sources"]), self.settings.top_n)
+        top = result["sources"][0]
+        self.assertIn("hết nhiên liệu", top["content"])
+        self.assertEqual(top["rerank_score"], 9.0)
+        self.assertGreaterEqual(top["initial_rank"], 1)
+        scores = [source["rerank_score"] for source in result["sources"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        # Đã chấm điểm nhiều ứng viên hơn số đoạn giữ lại
+        rerank_prompt = [call for call in self.llm.calls if call["schema"] is RERANK_SCHEMA][0]["prompt"]
+        self.assertEqual(len(re.findall(r"^\[\d+\] ", rerank_prompt, re.M)), self.settings.rerank_candidates)
+        self.assertEqual(result["usage"]["llm_calls"], 2)
+
+    def test_reasoning_mode_reports_usage(self):
+        self.upload()
+        result = self.ask(self.QUESTION, mode="reasoning")[-1]
+        self.assertEqual(result["mode"], "reasoning")
+        self.assertEqual(result["usage"]["llm_calls"], 2)  # phân tích + suy luận
+        self.assertTrue(result["evidence"][0]["verified"])
+        self.assertIn("Kiểm chứng trích dẫn với tài liệu", result["pipeline"])
+
+    def test_compare_runs_all_modes_in_order(self):
+        self.upload()
+        events = self.ask(self.QUESTION, mode="compare")
+        starts = [event["mode"] for event in events if event["type"] == "start"]
+        self.assertEqual(starts, ["llm", "rag", "rerank", "reasoning"])
+        self.assertEqual(events[-1], {"type": "done"})
+        for mode in starts:
+            result = self.result_of(events, mode)
+            self.assertTrue(result["answer"])
+            self.assertIn("total", result["timings"])
+        self.assertEqual(self.result_of(events, "llm")["sources"], [])
+
+    def test_compare_continues_after_one_mode_fails(self):
+        self.upload()
+        self.llm.fail_direct = True
+        events = self.ask(self.QUESTION, mode="compare")
+        errors = [event for event in events if event["type"] == "error"]
+        self.assertEqual([event["mode"] for event in errors], ["llm"])
+        self.assertIn("LLM thuần lỗi giả lập", errors[0]["message"])
+        self.assertEqual([event["mode"] for event in events if event["type"] == "result"], ["rag", "rerank", "reasoning"])
+        self.assertEqual(events[-1]["type"], "done")
+
+    def test_rag_modes_without_documents(self):
+        for mode in ("rag", "rerank"):
+            self.assertIn("chưa có tài liệu", self.ask(self.QUESTION, mode=mode)[-1]["answer"])
+        self.assertEqual(self.llm.calls, [])
+
+    def test_invalid_mode_rejected(self):
+        response = self.client.post(f"/api/conversations/{CONVERSATION}/ask", json={"question": "hỏi", "mode": "abc"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_llm_reranker_parsing(self):
+        class Reply:
+            def generate(self, prompt, system=None, json_schema=None, thinking_level=None):
+                return '{"scores": [{"id": 2, "score": 15}, {"id": 1, "score": "x"}, {"id": 9, "score": 5}]}'
+        scores = LLMReranker(Reply(), load_prompts(WEB_PROMPT_FILE)).score("q", ["a", "b", "c"])
+        self.assertEqual(scores, [0.0, 10.0, 0.0])  # kẹp về 0-10, bỏ id sai / điểm sai
 
 
 class TestAppShell(WebTestCase):
@@ -483,6 +604,22 @@ class TestProviders(unittest.TestCase):
 
         with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g", GROQ_MODELS=" a , b, a ,"), clear=True):
             self.assertEqual(describe_llm(create_llm()), ["groq/a", "groq/b"])
+
+    def test_fallback_waits_when_every_model_is_briefly_limited(self):
+        attempts = []
+
+        class Flaky:
+            def generate(self, prompt, system=None, json_schema=None, thinking_level=None):
+                attempts.append(time.time())
+                if len(attempts) == 1:
+                    raise ProviderError("groq", 429, "rate limit", retry_after=0.05)
+                return "ok"
+
+        llm = FallbackLLM([("groq/only", Flaky())])
+        self.assertEqual(llm.generate("hỏi"), "ok")
+        self.assertEqual(len(attempts), 2)
+        self.assertGreaterEqual(attempts[1] - attempts[0], 0.04)
+        self.assertEqual(llm.last_used, "groq/only")
 
     def test_rate_limit_rest_uses_retry_after(self):
         client = OpenAICompatibleClient("groq", "https://x/v1", "k", "m1", http_client=mock_http(

@@ -59,6 +59,12 @@ class WebSettings:
     chunk_size: int = field(default_factory=lambda: _env_int("WEB_CHUNK_SIZE", 800))
     overlap: int = field(default_factory=lambda: _env_int("WEB_CHUNK_OVERLAP", 150))
     top_n: int = field(default_factory=lambda: _env_int("WEB_TOP_N", 6))
+    # Phương pháp 03: số đoạn ứng viên lấy ra trước khi xếp hạng lại còn top_n
+    rerank_candidates: int = field(default_factory=lambda: _env_int("WEB_RERANK_CANDIDATES", 15))
+    # Phương pháp 04 có xếp hạng lại trước khi suy luận không (mặc định không: đúng nghĩa "RAG + Reasoning")
+    reasoning_rerank: bool = field(
+        default_factory=lambda: (os.getenv("WEB_REASONING_RERANK") or "").strip().lower() in ("1", "true", "yes")
+    )
     history_turns: int = 4
 
     # Vercel giới hạn body của request ở 4.5 MB

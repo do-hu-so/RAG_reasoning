@@ -34,6 +34,8 @@ from RAG.reasoning import (
     ReasonedAnswer,
     ReasoningAnswerer,
     describe_source,
+    format_context,
+    format_history,
     parse_json,
 )
 from read_file import TextChunker, read_pdf_pages
@@ -41,6 +43,7 @@ from read_file import TextChunker, read_pdf_pages
 from .config import WebSettings
 from .embeddings import Embedder, create_embedder
 from .keyword_search import BM25, tokenize
+from .reranking import LLMReranker
 from .storage import Storage, create_storage
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,22 @@ AUTO = object()
 # Embedding hết quota thì tạm ngừng thử bổ sung embedding cho tài liệu cũ (giây)
 EMBEDDING_REST_SECONDS = 15 * 60
 OVERVIEW_FILE = "overview.json"
+
+# 4 phương pháp hỏi–đáp để so sánh / đánh giá
+MODES: Dict[str, str] = {
+    "llm": "LLM thuần, không RAG",
+    "rag": "LLM + RAG thuần",
+    "rerank": "LLM + RAG + Reranking",
+    "reasoning": "LLM + RAG + Reasoning",
+}
+COMPARE_ORDER = ("llm", "rag", "rerank", "reasoning")
+STAGE_LABELS: Dict[str, str] = {
+    "analyzing": "Phân tích câu hỏi",
+    "retrieving": "Tìm đoạn liên quan",
+    "reranking": "Xếp hạng lại (rerank)",
+    "generating": "Sinh câu trả lời",
+    "reasoning": "Suy luận & kiểm chứng",
+}
 
 NO_DOCUMENT_MESSAGE = (
     "Cuộc trò chuyện này chưa có tài liệu nào. Hãy bấm biểu tượng 📎 (hoặc kéo thả) "
@@ -135,6 +154,44 @@ class StageTimer:
         if self._stage:
             self.timings[self._stage] = round(time.perf_counter() - self._stage_started, 3)
             self._stage = None
+
+
+class UsageRecorder:
+    """
+    Bọc LLM để đếm số lần gọi, số token và model đã trả lời trong một lần chạy
+    (chỉ số dùng để so sánh / đánh giá các phương pháp).
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
+        self.models: List[str] = []
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        thinking_level: Optional[str] = None,
+    ) -> str:
+        text = self.llm.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
+        self.calls += 1
+        model = getattr(self.llm, "last_used", None)
+        if model and model not in self.models:
+            self.models.append(model)
+        usage = getattr(self.llm, "last_usage", None) or {}
+        self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.completion_tokens += int(usage.get("completion_tokens") or 0)
+        return text
+
+    def summary(self) -> Dict[str, int]:
+        return {
+            "llm_calls": self.calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+        }
 
 
 def describe_error(error: Exception) -> str:
@@ -513,17 +570,23 @@ class WebRAGService:
         self,
         documents: Sequence[StoredDocument],
         queries: Sequence[str],
-    ) -> Tuple[List[Tuple[Document, float]], List[str]]:
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Tuple[Document, float]], List[str], bool]:
         """
         Hybrid search: gộp thứ hạng BM25 (từ khoá) và cosine (embedding) bằng
         Reciprocal Rank Fusion, cho mỗi truy vấn con.
 
+        Args:
+            limit: Số đoạn cần lấy (mặc định settings.top_n)
+
         Returns:
-            (các đoạn kèm độ liên quan tương đối 0-1, cảnh báo)
+            (các đoạn kèm độ liên quan tương đối 0-1, cảnh báo, có dùng tìm kiếm ngữ nghĩa không)
         """
+        limit = limit or self.settings.top_n
         pool = [(document, index) for document in documents for index in range(len(document.chunks))]
         fused: Dict[int, float] = defaultdict(float)
         warnings: List[str] = []
+        used_dense = False
 
         def add_ranking(scores: np.ndarray) -> None:
             for rank, position in enumerate(np.argsort(-scores)[:CANDIDATES_PER_RANKING]):
@@ -554,6 +617,7 @@ class WebRAGService:
                     "câu trả lời dựa trên tìm kiếm từ khoá."
                 )
             if query_vectors is not None:
+                used_dense = True
                 dense_ids = {id(document) for document in dense}
                 cosine = np.zeros((len(pool), len(queries)), dtype=np.float32)
                 offset = 0
@@ -567,9 +631,9 @@ class WebRAGService:
 
         if not fused:
             # Không đoạn nào khớp: dùng các đoạn đầu tài liệu (hữu ích cho câu hỏi kiểu "tóm tắt")
-            ranked = [(position, 0.0) for position in range(min(self.settings.top_n, len(pool)))]
+            ranked = [(position, 0.0) for position in range(min(limit, len(pool)))]
         else:
-            ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)[: self.settings.top_n]
+            ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)[:limit]
 
         best = ranked[0][1] if ranked and ranked[0][1] > 0 else 1.0
         results = []
@@ -590,7 +654,38 @@ class WebRAGService:
                 ),
                 score,
             ))
-        return results, warnings
+        return results, warnings, used_dense
+
+    def _rerank(
+        self,
+        question: str,
+        hits: List[Tuple[Document, float]],
+        llm: LLMClient,
+    ) -> Tuple[List[Tuple[Document, float]], List[str]]:
+        """
+        Xếp hạng lại các đoạn ứng viên bằng LLM, giữ top_n đoạn điểm cao nhất.
+
+        Ghi vào metadata mỗi đoạn: rerank_score (0-10) và initial_rank (thứ hạng trước khi rerank).
+        Lỗi thì giữ thứ tự tìm kiếm ban đầu và trả về cảnh báo.
+        """
+        top_n = self.settings.top_n
+        if not hits:
+            return hits, []
+        reranker = LLMReranker(llm, self.prompts, thinking_level=self.settings.analysis_thinking_level)
+        try:
+            scores = reranker.score(question, [document.page_content for document, _ in hits])
+        except Exception as error:
+            logger.warning("Reranking lỗi: %s", error)
+            return hits[:top_n], [f"Không xếp hạng lại được ({describe_error(error)}); dùng thứ tự tìm kiếm ban đầu."]
+
+        order = sorted(range(len(hits)), key=lambda position: (-scores[position], position))[:top_n]
+        reranked = []
+        for position in order:
+            document, fused = hits[position]
+            document.metadata["rerank_score"] = round(scores[position], 2)
+            document.metadata["initial_rank"] = position + 1
+            reranked.append((document, fused))
+        return reranked, []
 
     @staticmethod
     def _result_event(
@@ -622,6 +717,8 @@ class WebRAGService:
                     "page_number": document.metadata["page_number"],
                     "page_end": document.metadata["page_end"],
                     "score": round(score, 4),
+                    "rerank_score": document.metadata.get("rerank_score"),
+                    "initial_rank": document.metadata.get("initial_rank"),
                     "content": document.page_content,
                 }
                 for index, (document, score) in enumerate(hits, start=1)
@@ -633,53 +730,163 @@ class WebRAGService:
         conversation_id: str,
         question: str,
         history: Sequence[Tuple[str, str]] = (),
+        mode: str = "reasoning",
     ) -> Iterator[Dict[str, Any]]:
         """
-        Trả lời câu hỏi, lần lượt sinh ra các sự kiện:
-        {"type": "status", "elapsed": ...} khi bắt đầu mỗi bước và cuối cùng
-        {"type": "result", "timings": {...}, ...} kèm thời gian từng bước (giây).
+        Trả lời câu hỏi theo một phương pháp, hoặc chạy lần lượt cả 4 để so sánh.
+
+        Args:
+            mode: "llm" | "rag" | "rerank" | "reasoning" | "compare"
+
+        Mỗi phương pháp sinh ra các sự kiện (đều có trường "mode"):
+        {"type": "start", "stages": [...]}, {"type": "status", "elapsed": ...} cho từng bước,
+        rồi {"type": "result", "timings": {...}, "usage": {...}, "models": [...], ...}.
+        Chế độ "compare" kết thúc bằng {"type": "done"}; phương pháp nào lỗi thì gửi
+        {"type": "error", "mode": ...} và các phương pháp còn lại vẫn chạy tiếp.
         """
         self.check_conversation_id(conversation_id)
+        if mode != "compare" and mode not in MODES:
+            raise ServiceError(400, "Phương pháp không hợp lệ.")
         question = question.strip()
         if not question:
             raise ServiceError(400, "Câu hỏi đang trống.")
 
-        timer = StageTimer()
-
-        def status(stage: str, message: str) -> Dict[str, Any]:
-            timer.start(stage)
-            return {"type": "status", "stage": stage, "message": message, "elapsed": timer.elapsed()}
-
         metas = self.list_documents(conversation_id)
         history = list(history)[-self.settings.history_turns:]
 
-        yield status("analyzing", "Đang phân tích câu hỏi")
-        analyzer = QueryAnalyzer(self.llm, self.prompts, thinking_level=self.settings.analysis_thinking_level)
-        names = "\n".join(f"- {meta['filename']}" for meta in metas) or "(chưa có tài liệu nào)"
-        analysis = analyzer.analyze(question, history, documents=names)
-
-        if analysis.category != "document":
-            reply = analysis.direct_reply or OUT_OF_SCOPE_MESSAGE
-            answer = ReasonedAnswer(answer=reply, answerable=False, confidence="cao")
-            yield self._result_event(question, analysis, answer, timer.finish())
+        if mode != "compare":
+            yield from self._run_mode(mode, conversation_id, question, history, metas)
             return
 
+        for item in COMPARE_ORDER:
+            try:
+                yield from self._run_mode(item, conversation_id, question, history, metas)
+            except Exception as error:
+                if not isinstance(error, ServiceError):
+                    logger.exception("Lỗi khi chạy phương pháp %s", item)
+                yield {"type": "error", "mode": item, "message": describe_error(error)}
+        yield {"type": "done"}
+
+    def _run_mode(
+        self,
+        mode: str,
+        conversation_id: str,
+        question: str,
+        history: Sequence[Tuple[str, str]],
+        metas: List[Dict[str, Any]],
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Chạy một phương pháp:
+        - llm:       hỏi thẳng LLM, không dùng tài liệu
+        - rag:       tìm top_n đoạn theo câu hỏi gốc -> prompt RAG cơ bản
+        - rerank:    tìm nhiều đoạn ứng viên -> LLM xếp hạng lại -> top_n -> prompt RAG cơ bản
+        - reasoning: phân tích câu hỏi -> tìm theo truy vấn con -> suy luận có trích dẫn -> kiểm chứng
+        """
+        llm = UsageRecorder(self.llm)
+        timer = StageTimer()
+        use_rerank = mode == "rerank" or (mode == "reasoning" and self.settings.reasoning_rerank)
+
+        stages = {
+            "llm": ["generating"],
+            "rag": ["retrieving", "generating"],
+            "rerank": ["retrieving", "reranking", "generating"],
+            "reasoning": ["analyzing", "retrieving"] + (["reranking"] if use_rerank else []) + ["reasoning"],
+        }[mode]
+        yield {
+            "type": "start",
+            "mode": mode,
+            "title": MODES[mode],
+            "stages": [{"key": key, "label": STAGE_LABELS[key]} for key in stages],
+        }
+
+        def status(stage: str, message: str) -> Dict[str, Any]:
+            timer.start(stage)
+            return {"type": "status", "mode": mode, "stage": stage, "message": message, "elapsed": timer.elapsed()}
+
+        def finish(result: ReasonedAnswer, analysis: QueryAnalysis, hits=(), pipeline=()) -> Dict[str, Any]:
+            event = self._result_event(question, analysis, result, timer.finish(), hits)
+            event.update(
+                mode=mode,
+                title=MODES[mode],
+                models=list(llm.models),
+                usage=llm.summary(),
+                pipeline=list(pipeline),
+            )
+            return event
+
+        # 01 — LLM thuần: không tìm tài liệu
+        if mode == "llm":
+            yield status("generating", "Đang hỏi LLM (không dùng tài liệu)")
+            answer = llm.generate(
+                fill_template(self.prompts["direct_user"], history=format_history(history), question=question),
+                system=self.prompts["direct_system"],
+                thinking_level=self.settings.thinking_level,
+            )
+            yield finish(
+                ReasonedAnswer(answer=answer.strip(), answerable=True, confidence=""),
+                QueryAnalysis("document", question, []),
+                pipeline=["Không dùng tài liệu", "LLM trả lời bằng hiểu biết sẵn có"],
+            )
+            return
+
+        pipeline: List[str] = []
+        if mode == "reasoning":
+            yield status("analyzing", "Đang phân tích câu hỏi")
+            analyzer = QueryAnalyzer(llm, self.prompts, thinking_level=self.settings.analysis_thinking_level)
+            names = "\n".join(f"- {meta['filename']}" for meta in metas) or "(chưa có tài liệu nào)"
+            analysis = analyzer.analyze(question, history, documents=names)
+            pipeline.append("Phân tích & viết lại câu hỏi")
+
+            if analysis.category != "document":
+                reply = analysis.direct_reply or OUT_OF_SCOPE_MESSAGE
+                yield finish(ReasonedAnswer(answer=reply, answerable=False, confidence="cao"), analysis, pipeline=pipeline)
+                return
+            queries = analysis.sub_queries or [analysis.standalone_question]
+            search_question = analysis.standalone_question
+        else:
+            # RAG thuần: tìm theo nguyên văn câu hỏi, không viết lại / tách truy vấn
+            analysis = QueryAnalysis("document", question, [question])
+            queries = [question]
+            search_question = question
+
         if not metas:
-            answer = ReasonedAnswer(answer=NO_DOCUMENT_MESSAGE, answerable=False)
-            yield self._result_event(question, analysis, answer, timer.finish())
+            yield finish(ReasonedAnswer(answer=NO_DOCUMENT_MESSAGE, answerable=False, confidence=""), analysis, pipeline=pipeline)
             return
 
         yield status("retrieving", f"Đang tìm trong {len(metas)} tài liệu")
         documents = [self._load_document(meta, conversation_id) for meta in metas]
         self._embed_missing(documents, conversation_id)
-        hits, search_warnings = self._retrieve(documents, analysis.sub_queries or [analysis.standalone_question])
+        limit = self.settings.rerank_candidates if use_rerank else self.settings.top_n
+        hits, warnings, used_dense = self._retrieve(documents, queries, limit=limit)
+        method = "từ khoá BM25 + ngữ nghĩa" if used_dense else "từ khoá BM25"
+        pipeline.append(f"Tìm {len(hits)} đoạn ({method})")
 
-        yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
-        answerer = ReasoningAnswerer(self.llm, self.prompts)
-        result = answerer.answer(analysis.standalone_question, [document for document, _ in hits])
-        result.warnings = search_warnings + result.warnings
+        if use_rerank:
+            yield status("reranking", f"Đang xếp hạng lại {len(hits)} đoạn")
+            hits, rerank_warnings = self._rerank(search_question, hits, llm)
+            warnings += rerank_warnings
+            pipeline.append(f"LLM xếp hạng lại, giữ {len(hits)} đoạn tốt nhất")
 
-        yield self._result_event(question, analysis, result, timer.finish(), hits)
+        if mode == "reasoning":
+            yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
+            result = ReasoningAnswerer(llm, self.prompts).answer(search_question, [document for document, _ in hits])
+            result.warnings = warnings + result.warnings
+            pipeline += ["Suy luận từng bước có trích dẫn", "Kiểm chứng trích dẫn với tài liệu"]
+        else:
+            yield status("generating", f"Đang tạo câu trả lời từ {len(hits)} đoạn")
+            answer = llm.generate(
+                fill_template(
+                    self.prompts["plain_rag_user"],
+                    context=format_context([document for document, _ in hits]),
+                    question=question,
+                ),
+                system=self.prompts["plain_rag_system"],
+                thinking_level=self.settings.thinking_level,
+            )
+            result = ReasonedAnswer(answer=answer.strip(), answerable=True, confidence="", warnings=warnings)
+            pipeline.append("LLM trả lời từ các đoạn tìm được")
+
+        yield finish(result, analysis, hits, pipeline)
 
 
 _service: Optional[WebRAGService] = None

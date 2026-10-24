@@ -15,6 +15,7 @@ Version: 4.0.0
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union
@@ -155,6 +156,14 @@ class OpenAICompatibleClient:
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         self._http = http_client or httpx.Client(timeout=timeout)
         self._reasoning_supported = "gpt-oss" in model
+        self._local = threading.local()
+
+    @property
+    def last_usage(self) -> Optional[Dict[str, int]]:
+        """
+        Số token của lần gọi gần nhất trong luồng hiện tại (prompt_tokens, completion_tokens).
+        """
+        return getattr(self._local, "last_usage", None)
 
     def _post(self, body: Dict[str, Any]) -> Dict[str, Any]:
         response = self._http.post(self._url, headers=self._headers, json=body)
@@ -213,6 +222,12 @@ class OpenAICompatibleClient:
             raise ProviderError(self.name, 502, f"Phản hồi không đúng định dạng: {str(data)[:300]}") from None
         if not text:
             raise ProviderError(self.name, 502, "Model không trả về nội dung")
+
+        usage = data.get("usage") or {}
+        self._local.last_usage = {
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+        }
         return text
 
 
@@ -221,20 +236,43 @@ class FallbackLLM:
     Gọi lần lượt nhiều model: model đầu lỗi (hết quota, lỗi mạng, ...) thì tự chuyển
     sang model kế tiếp.
 
-    Model vừa hết quota được "nghỉ" theo header retry-after (hoặc 60 giây) để không tốn
-    request vô ích.
+    - Model vừa hết quota được "nghỉ" theo header retry-after (hoặc 60 giây).
+    - Mọi model đều đang chạm giới hạn theo phút (chỉ cần chờ ngắn) thì chờ rồi thử lại
+      một lần, thay vì báo lỗi ngay.
+    - Ghi lại model đã trả lời (last_used, riêng cho từng luồng xử lý) để hiển thị.
     """
 
-    def __init__(self, providers: Sequence[Tuple[str, LLMClient]], cooldown_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        providers: Sequence[Tuple[str, LLMClient]],
+        cooldown_seconds: float = 60.0,
+        max_wait_seconds: float = 20.0,
+    ) -> None:
         if not providers:
             raise ValueError("FallbackLLM cần ít nhất một model")
         self.providers = list(providers)
         self.cooldown_seconds = cooldown_seconds
+        self.max_wait_seconds = max_wait_seconds
         self._resting_until: Dict[str, float] = {}
+        self._local = threading.local()
 
     @property
     def names(self) -> List[str]:
         return [name for name, _ in self.providers]
+
+    @property
+    def last_used(self) -> Optional[str]:
+        """
+        Model đã trả lời lần gọi gần nhất trong luồng hiện tại.
+        """
+        return getattr(self._local, "last_used", None)
+
+    @property
+    def last_usage(self) -> Optional[Dict[str, int]]:
+        """
+        Số token của lần gọi gần nhất trong luồng hiện tại.
+        """
+        return getattr(self._local, "last_usage", None)
 
     def generate(
         self,
@@ -243,20 +281,35 @@ class FallbackLLM:
         json_schema: Optional[Dict[str, Any]] = None,
         thinking_level: Optional[str] = None,
     ) -> str:
-        now = time.time()
-        # Ưu tiên model không trong thời gian nghỉ, giữ nguyên thứ tự cấu hình
-        ordered = sorted(self.providers, key=lambda item: self._resting_until.get(item[0], 0) > now)
-
         last_error: Optional[Exception] = None
-        for name, client in ordered:
-            try:
-                return client.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
-            except Exception as error:
-                last_error = error
-                if is_rate_limit_error(error):
-                    rest = getattr(error, "retry_after", None) or self.cooldown_seconds
-                    self._resting_until[name] = time.time() + rest
-                logger.warning("LLM %s lỗi (%s), chuyển sang model kế tiếp.", name, error)
+        for attempt in range(2):
+            now = time.time()
+            # Ưu tiên model không trong thời gian nghỉ, giữ nguyên thứ tự cấu hình
+            ordered = sorted(self.providers, key=lambda item: self._resting_until.get(item[0], 0) > now)
+            waits: List[Optional[float]] = []
+
+            for name, client in ordered:
+                try:
+                    text = client.generate(prompt, system=system, json_schema=json_schema, thinking_level=thinking_level)
+                    self._local.last_used = name
+                    self._local.last_usage = getattr(client, "last_usage", None)
+                    return text
+                except Exception as error:
+                    last_error = error
+                    if is_rate_limit_error(error):
+                        rest = getattr(error, "retry_after", None) or self.cooldown_seconds
+                        self._resting_until[name] = time.time() + rest
+                        waits.append(rest)
+                    else:
+                        waits.append(None)
+                    logger.warning("LLM %s lỗi (%s), chuyển sang model kế tiếp.", name, error)
+
+            # Tất cả đều chỉ bị giới hạn theo phút -> chờ model sớm nhất rồi thử lại một lần
+            shortest = min((wait for wait in waits if wait is not None), default=None)
+            if attempt == 0 and None not in waits and shortest is not None and shortest <= self.max_wait_seconds:
+                time.sleep(shortest)
+                continue
+            break
         raise last_error
 
 
@@ -289,7 +342,8 @@ def create_llm(
         api_key: API key; mặc định đọc GROQ_API_KEY
 
     Returns:
-        Client của một model, hoặc FallbackLLM khi có nhiều model
+        FallbackLLM gồm các model theo thứ tự (kể cả khi chỉ có một model,
+        để vẫn có chờ-rồi-thử-lại khi chạm giới hạn theo phút)
 
     Raises:
         ValueError: Khi chưa có GROQ_API_KEY
@@ -306,8 +360,6 @@ def create_llm(
         (f"groq/{model}", OpenAICompatibleClient("groq", GROQ_BASE_URL, api_key, model, thinking_level=thinking_level))
         for model in names
     ]
-    if len(providers) == 1:
-        return providers[0][1]
     return FallbackLLM(providers)
 
 

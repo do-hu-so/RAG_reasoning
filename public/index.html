@@ -55,6 +55,10 @@
           <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M3 6h18v2H3V6Zm0 5h18v2H3v-2Zm0 5h18v2H3v-2Z"/></svg>
         </button>
         <h1 class="conv-title" id="conv-title">Cuộc trò chuyện mới</h1>
+        <button class="docs-btn" id="export-btn" type="button" title="Tải bảng đánh giá các câu trả lời (CSV)">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M11 4h2v8.2l3.6-3.6 1.4 1.4-6 6-6-6 1.4-1.4 3.6 3.6V4ZM5 18h14v2H5v-2Z"/></svg>
+          <span class="docs-btn-label">Xuất đánh giá</span>
+        </button>
         <button class="docs-btn" id="docs-btn" type="button" aria-controls="docs-panel">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V9h5.5L13 3.5Z"/></svg>
           <span id="docs-count">0</span><span class="docs-btn-label">&nbsp;tài liệu</span>
@@ -73,6 +77,14 @@
           <button type="button" class="icon-btn attach-btn" id="attach-btn" aria-label="Tải PDF lên" title="Tải PDF lên">
             <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M16.5 6.5v10.1a4.5 4.5 0 0 1-9 0V5.9a3 3 0 0 1 6 0v9.6a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5.9a4.5 4.5 0 0 0-9 0v10.7a6 6 0 0 0 12 0V6.5h-1.5Z"/></svg>
           </button>
+          <div class="mode-picker" id="mode-picker">
+            <button type="button" class="mode-btn" id="mode-btn" aria-haspopup="menu" aria-expanded="false">
+              <span class="mode-num" id="mode-num">⇄</span>
+              <span class="mode-btn-label" id="mode-label">So sánh 4</span>
+              <svg class="mode-chevron" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="m7 10 5 5 5-5H7Z"/></svg>
+            </button>
+            <div class="mode-menu" id="mode-menu" role="menu" hidden></div>
+          </div>
           <textarea id="input" rows="1" placeholder="Hỏi về tài liệu của bạn…" aria-label="Câu hỏi"></textarea>
           <button type="submit" class="send-btn" id="send-btn" aria-label="Gửi" disabled>
             <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M11 20V7.8l-5.6 5.6L4 12l8-8 8 8-1.4 1.4L13 7.8V20h-2Z"/></svg>

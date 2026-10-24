@@ -30,6 +30,8 @@
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --mark-bg: #fff0a1;
+  --mode: #c1203b;
+  --mode-soft: #fcecee;
   --sidebar-w: 268px;
   --cite-w: 420px;
   --content-w: 768px;
@@ -62,6 +64,8 @@
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
     --mark-bg: rgba(250, 204, 21, 0.3);
+    --mode: #f0566f;
+    --mode-soft: #3a1d24;
     color-scheme: dark;
   }
 }
@@ -91,6 +95,8 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   --mark-bg: rgba(250, 204, 21, 0.3);
+  --mode: #f0566f;
+  --mode-soft: #3a1d24;
   color-scheme: dark;
 }
 
@@ -334,6 +340,8 @@ button:disabled { cursor: not-allowed; }
   min-height: 0;
   overflow-y: auto;
   scroll-behavior: smooth;
+  /* để khối so sánh 4 phương pháp co giãn theo độ rộng khung chat (cqw / @container) */
+  container-type: inline-size;
 }
 
 .messages-inner {
@@ -383,29 +391,40 @@ button:disabled { cursor: not-allowed; }
 .dropzone strong { color: var(--text); font-size: 16px; }
 .dropzone span { font-size: 13px; }
 
-.features {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+/* danh sách 4 phương pháp ở màn hình trống */
+.mode-intro {
   width: 100%;
   max-width: 640px;
   margin-top: 26px;
   text-align: left;
 }
-
-.feature {
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  font-size: 13px;
-  color: var(--text-muted);
+.mode-intro-title {
+  margin: 0 0 8px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: center;
 }
-.feature b {
-  display: block;
-  margin-bottom: 2px;
-  color: var(--text);
-  font-size: 14px;
+.mode-list { display: grid; gap: 8px; margin-bottom: 8px; }
+.mode-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1.5px solid transparent;
+  border-radius: 12px;
+  background: var(--mode-soft);
+  text-align: left;
 }
+.mode-row:hover { border-color: color-mix(in srgb, var(--mode) 35%, transparent); }
+.mode-row.active { border-color: var(--mode); }
+.mode-row .mode-num { min-width: 34px; height: 34px; font-size: 13px; }
+.mode-row-text { display: grid; min-width: 0; }
+.mode-row-text strong { font-size: 15px; }
+.mode-row-text small { color: var(--text-muted); font-size: 13px; }
+.mode-row.compare { background: transparent; border: 1.5px dashed var(--border-strong); }
+.mode-row.compare.active { border-style: solid; border-color: var(--mode); }
 
 /* ------------------------------------------------------------------ messages */
 .msg { margin: 22px 0; }
@@ -748,6 +767,215 @@ button:disabled { cursor: not-allowed; }
 .timing-table dt { color: var(--text-muted); }
 .timing-table dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
 .timing-table .total { color: var(--text); font-weight: 600; }
+
+/* ------------------------------------------------------------------ phương pháp 01–04 */
+.mode-num {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--mode);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.mode-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 3px 12px 3px 3px;
+  border-radius: 999px;
+  background: var(--mode-soft);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.mode-tag .mode-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mode-tag.short { gap: 6px; padding-right: 10px; font-size: 12.5px; }
+.mode-tag.short .mode-num { min-width: 22px; height: 22px; font-size: 10.5px; }
+.mode-header { margin-bottom: 10px; }
+
+/* nút chọn phương pháp trong khung nhập */
+.mode-picker { position: relative; flex: none; }
+.mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 8px 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.mode-btn:hover { background: var(--bg-hover); }
+.mode-btn .mode-num { min-width: 24px; height: 24px; font-size: 11px; }
+.mode-chevron { color: var(--text-faint); }
+
+.mode-menu {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 0;
+  z-index: 35;
+  width: min(370px, calc(100vw - 32px));
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-elevated);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
+}
+.mode-menu-title { padding: 6px 10px 4px; color: var(--text-faint); font-size: 12px; font-weight: 600; }
+.mode-menu-sep { height: 1px; margin: 6px 4px; background: var(--border); }
+.mode-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+}
+.mode-item:hover { background: var(--bg-hover); }
+.mode-item.active { background: var(--mode-soft); }
+.mode-item-text { display: grid; flex: 1; min-width: 0; }
+.mode-item-text strong { font-size: 14px; font-weight: 600; }
+.mode-item-text small { color: var(--text-muted); font-size: 12.5px; line-height: 1.4; }
+.mode-check { display: inline-grid; color: var(--mode); }
+
+/* chỉ số đánh giá, quy trình, chấm điểm */
+.metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+.metric-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pipeline { margin: 8px 0 0; color: var(--text-faint); font-size: 12.5px; }
+
+.rating {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.rating-label { color: var(--text-faint); font-size: 12.5px; font-weight: 600; }
+.rate-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.rate-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.rate-btn.correct.active { border-color: var(--ok); background: var(--ok-bg); color: var(--ok); }
+.rate-btn.partial.active { border-color: var(--warn); background: var(--warn-bg); color: var(--warn); }
+.rate-btn.wrong.active { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
+
+/* ------------------------------------------------------------------ so sánh 4 phương pháp */
+.msg.compare { position: relative; }
+@supports (width: 1cqw) {
+  /* rộng hơn cột chat thường để 4 câu trả lời đặt cạnh nhau */
+  .msg.compare {
+    width: min(1180px, calc(100cqw - 32px));
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+.compare-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.compare-title { font-weight: 650; }
+
+.compare-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+@container (min-width: 780px) {
+  .compare-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.mode-card.pending { border-color: color-mix(in srgb, var(--mode) 45%, var(--border)); }
+.mode-card.citing { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.mode-card-head { margin-bottom: 10px; }
+.mode-card-body { min-width: 0; }
+.mode-card .markdown { font-size: 14.5px; }
+.mode-waiting { margin: 0; color: var(--text-faint); font-size: 14px; }
+
+.markdown.clamped {
+  max-height: 280px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent);
+  mask-image: linear-gradient(to bottom, #000 72%, transparent);
+}
+.expand-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.compare-summary { margin-top: 14px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 14px; }
+.compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.compare-table th, .compare-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.compare-table th { background: var(--bg-muted); color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.compare-table td { font-variant-numeric: tabular-nums; }
+.compare-table tbody tr:last-child td { border-bottom: 0; }
+.compare-table .rating-cell { color: var(--text-faint); }
+.compare-table tr.rated-correct .rating-cell { color: var(--ok); font-weight: 650; }
+.compare-table tr.rated-partial .rating-cell { color: var(--warn); font-weight: 650; }
+.compare-table tr.rated-wrong .rating-cell { color: var(--bad); font-weight: 650; }
+.compare-warning {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 13px;
+}
+.compare-hint { margin: 8px 0 0; color: var(--text-faint); font-size: 12.5px; }
 
 /* ------------------------------------------------------------------ hộp trích dẫn văn bản gốc */
 .cite-panel {
@@ -1129,6 +1357,8 @@ mark.ev {
 
   .topbar { padding: 0 8px; }
   .docs-btn-label { display: none; }
+  .mode-btn-label { display: none; }
+  .mode-btn { padding: 0 6px; }
   .messages-inner { padding: 4px 16px 20px; }
   .composer-wrap { padding: 0 12px 8px; }
   .bubble { max-width: 90%; }

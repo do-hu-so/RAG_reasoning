@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Iterator, List
+from typing import Iterator, List, Literal
 from urllib.parse import quote
 
 import webapp  # noqa: F401  (thêm RAG_system vào sys.path)
@@ -42,6 +42,8 @@ class HistoryTurn(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     history: List[HistoryTurn] = Field(default_factory=list, max_length=20)
+    # 01 llm | 02 rag | 03 rerank | 04 reasoning | compare: chạy lần lượt cả 4
+    mode: Literal["llm", "rag", "rerank", "reasoning", "compare"] = "reasoning"
 
 
 @app.exception_handler(ServiceError)
@@ -137,7 +139,7 @@ def ask(conversation_id: str, request: AskRequest) -> StreamingResponse:
 
     def events() -> Iterator[str]:
         try:
-            for event in service.ask(conversation_id, request.question, history):
+            for event in service.ask(conversation_id, request.question, history, mode=request.mode):
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as error:
             if not isinstance(error, ServiceError):
