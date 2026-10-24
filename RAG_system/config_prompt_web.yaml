@@ -18,9 +18,13 @@ query_analysis_system: |
   - standalone_question: viết lại câu hỏi mới thành câu hỏi độc lập, đủ ngữ cảnh,
     thay các từ như "nó", "cái đó", "còn ... thì sao" bằng đối tượng cụ thể trong lịch sử.
     Giữ nguyên ngôn ngữ của người dùng.
-  - sub_queries: 1 đến 3 truy vấn tìm kiếm ngắn, mỗi truy vấn nhắm vào một ý cần tra trong tài liệu,
-    dùng từ khoá có khả năng xuất hiện trong tài liệu. Câu hỏi đơn giản chỉ cần 1 truy vấn.
-    Câu hỏi kiểu "tóm tắt tài liệu" thì dùng các truy vấn về mục đích, nội dung chính, kết luận.
+  - sub_queries: 2 đến 4 truy vấn tìm kiếm ngắn, khác nhau, dùng từ ngữ có khả năng xuất hiện
+    trong tài liệu (không lặp lại nguyên văn câu hỏi):
+      + câu hỏi nhiều ý: mỗi truy vấn nhắm vào một ý cần tra;
+      + câu hỏi một ý: diễn đạt ý đó theo các cách / thuật ngữ khác mà tài liệu có thể dùng
+        (ví dụ "bao nhiêu tín chỉ để tốt nghiệp" -> "tổng số tín chỉ toàn khoá",
+        "khối lượng học tập tối thiểu", "điều kiện tốt nghiệp");
+      + câu hỏi kiểu "tóm tắt tài liệu": các truy vấn về mục đích, nội dung chính, kết luận.
   - direct_reply: chỉ điền khi category là "chitchat" hoặc "out_of_scope": một câu trả lời ngắn,
     thân thiện (với "out_of_scope" thì nhắc rằng bạn trả lời dựa trên tài liệu đã tải lên).
     Để chuỗi rỗng khi category là "document".

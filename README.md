@@ -51,22 +51,24 @@ Câu trả lời
 
 Nút chọn phương pháp nằm cạnh ô nhập câu hỏi. Mặc định là **"So sánh cả 4"**: mỗi câu hỏi chạy lần lượt cả 4 phương pháp, rồi hiện 4 câu trả lời cạnh nhau để đánh giá.
 
-| | Phương pháp | Cách làm | Số lần gọi LLM |
-|---|---|---|---|
-| 01 | LLM thuần, không RAG | Hỏi thẳng LLM, không đưa tài liệu | 1 |
-| 02 | LLM + RAG thuần | Tìm `WEB_TOP_N` đoạn theo nguyên văn câu hỏi → prompt RAG cơ bản | 1 |
-| 03 | LLM + RAG + Reranking | Tìm `WEB_RERANK_CANDIDATES` đoạn ứng viên → LLM chấm điểm 0–10 từng đoạn → giữ `WEB_TOP_N` đoạn điểm cao nhất → prompt RAG cơ bản | 2 |
-| 04 | LLM + RAG + Reasoning | Phân tích & viết lại câu hỏi, tách truy vấn con → tìm đoạn → suy luận từng bước có trích dẫn → kiểm chứng trích dẫn | 2 |
+| | Phương pháp | Tìm đoạn tài liệu | Trả lời | Số lần gọi LLM |
+|---|---|---|---|---|
+| 01 | LLM thuần, không RAG | Không tìm | LLM trả lời bằng hiểu biết sẵn có | 1 |
+| 02 | LLM + RAG thuần | `WEB_TOP_N` đoạn có embedding gần nhất với **nguyên văn câu hỏi** (cosine) | Đưa thẳng các đoạn cho LLM | 1 |
+| 03 | LLM + RAG + Reranking | Như 02 nhưng lấy `WEB_RERANK_CANDIDATES` đoạn ứng viên, rồi **LLM đọc và chấm 0–10 từng đoạn**, giữ `WEB_TOP_N` đoạn điểm cao nhất | Như 02 | 2 |
+| 04 | LLM + RAG + Reasoning | **LLM tách câu hỏi thành 2–4 truy vấn**, tìm theo từng truy vấn bằng cả từ khoá (BM25) và ngữ nghĩa rồi gộp (RRF) | **Suy luận từng bước, trích nguyên văn làm bằng chứng**, rồi kiểm chứng trích dẫn với tài liệu | 2 |
 
-- Cả 4 phương pháp dùng **cùng một bộ tìm kiếm** (BM25, cộng thêm ngữ nghĩa nếu có Cloudflare), nên khác biệt giữa 02, 03 và 04 chỉ đến từ reranking và reasoning.
-- **Chỉ số hiện cho từng phương pháp:** thời gian phản hồi (kèm thời gian từng bước, không tính thời gian chờ hạn mức Groq), số lần gọi LLM, số token vào/ra, số đoạn tài liệu, model đã trả lời. Riêng 04 có thêm độ tin cậy và số trích dẫn khớp tài liệu. Hộp "Văn bản gốc" hiện đúng các đoạn đã đưa cho LLM; với 03 có thêm điểm rerank và thứ hạng trước khi rerank.
-- **Chấm điểm thủ công:** mỗi câu trả lời có nút Đúng / Một phần / Sai. Bảng tổng hợp dưới mỗi câu hỏi gom toàn bộ chỉ số và điểm đã chấm.
+- Mỗi phương pháp tìm đoạn theo cách riêng nên các đoạn tìm được và câu trả lời khác nhau. Mỗi khung trả lời ghi mô tả phương pháp và dòng "Quy trình" với số đoạn thực tế.
+- 02 và 03 là RAG thuần: chỉ so độ tương đồng với nguyên văn câu hỏi. Chưa có embedding (không cấu hình Cloudflare) thì hai phương pháp này tìm theo từ khoá.
+- **Chỉ số hiện cho từng phương pháp:** thời gian phản hồi (kèm thời gian từng bước), số lần gọi LLM, số token vào/ra, số đoạn tài liệu, model đã trả lời. Riêng 04 có thêm số trích dẫn khớp tài liệu.
+- **Hộp "Văn bản gốc"** hiện đúng các đoạn đã đưa cho LLM và ghi cách các đoạn đó được chọn. Con số cạnh mỗi đoạn là độ tương đồng (02), điểm LLM chấm và thứ hạng lúc tìm (03), hoặc điểm tìm kiếm (04).
+- **Chấm điểm thủ công:** mỗi câu trả lời có nút Đúng / Một phần / Sai.
 - **Xuất đánh giá:** nút "Xuất đánh giá" trên thanh tiêu đề tải file CSV của cả cuộc trò chuyện (mở được bằng Excel / Google Sheets). Mỗi dòng gồm câu hỏi, phương pháp, các chỉ số, điểm chấm và câu trả lời.
 - **Lưu ý khi so sánh:**
   - **Chế độ so sánh dùng cùng một model cho cả 4 phương pháp** (mặc định `openai/gpt-oss-20b`, nhanh hơn `gpt-oss-120b`; đổi bằng `COMPARE_MODEL`). Tên model hiện ở đầu khung so sánh.
-  - Một lượt so sánh tốn khoảng 15–20 nghìn token, vượt hạn mức 8.000 token/phút của `gpt-oss-20b`. Nếu có nhiều key Groq, app dùng key khác (vẫn cùng model) trước. Khi chạm giới hạn, app **chờ Groq cấp lại hạn mức** (theo header `retry-after`, tối đa `COMPARE_MAX_WAIT` giây mỗi lần) thay vì đổi model. Thời gian chờ hiện riêng ("⏳ chờ quota") và **không cộng vào thời gian phản hồi** của từng phương pháp, nên so sánh tốc độ vẫn công bằng.
+  - Một lượt so sánh tốn khoảng 15–20 nghìn token, vượt hạn mức 8.000 token/phút của `gpt-oss-20b`. Nếu có nhiều key Groq, app dùng key khác (vẫn cùng model) trước. Khi chạm giới hạn, app **chờ Groq cấp lại hạn mức** (theo header `retry-after`, tối đa `COMPARE_MAX_WAIT` giây mỗi lần) thay vì đổi model. Thời gian chờ **không cộng vào thời gian phản hồi** của từng phương pháp, nên so sánh tốc độ vẫn công bằng; tổng thời gian chờ chỉ hiện ở đầu khung so sánh.
   - Hạn mức theo ngày của `gpt-oss-20b` (200.000 token, bằng `gpt-oss-120b`) đủ cho khoảng 10–15 câu hỏi so sánh với mỗi key. Hết hạn mức ngày thì phương pháp đó báo lỗi; khi đó có thể hỏi riêng từng phương pháp (vẫn tự chuyển model) hoặc đặt `COMPARE_MODEL` sang model khác.
-  - Khi hỏi riêng một phương pháp, app vẫn tự chuyển model khi hết quota. Nếu các phương pháp trong một lần so sánh dùng model khác nhau (tin nhắn cũ), bảng tổng hợp sẽ cảnh báo.
+  - Khi hỏi riêng một phương pháp, app vẫn tự chuyển model khi hết quota.
   - Bản web rerank bằng LLM, vì Vercel không chạy được cross-encoder; bản dòng lệnh dùng cross-encoder `bge-reranker-v2-m3`.
   - Phương pháp 04 mặc định không rerank, đúng nghĩa "RAG + Reasoning". Đặt `WEB_REASONING_RERANK=1` nếu muốn 04 gồm cả reranking.
 
@@ -178,7 +180,7 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 | `BLOB_ACCESS` | `private` | Chế độ của Vercel Blob store |
 | `MAX_UPLOAD_MB` | `4` | Dung lượng tối đa mỗi PDF |
 | `WEB_CHUNK_SIZE` / `WEB_CHUNK_OVERLAP` / `WEB_TOP_N` | `800` / `150` / `6` | Chia đoạn và số đoạn đưa cho LLM (bản web) |
-| `WEB_RERANK_CANDIDATES` | `15` | Phương pháp 03: số đoạn ứng viên trước khi xếp hạng lại |
+| `WEB_RERANK_CANDIDATES` | `20` | Phương pháp 03: số đoạn ứng viên trước khi xếp hạng lại |
 | `WEB_REASONING_RERANK` | (tắt) | Đặt `1` để phương pháp 04 xếp hạng lại trước khi suy luận |
 | `EMBEDDING_MODEL` / `RERANKER_MODEL` | `BAAI/bge-m3` / `BAAI/bge-reranker-v2-m3` | Model của bản dòng lệnh |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_INITIAL_K` / `RAG_TOP_N` | `500` / `100` / `10` / `5` | Tham số của bản dòng lệnh |

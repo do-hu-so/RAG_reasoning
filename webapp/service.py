@@ -697,25 +697,75 @@ class WebRAGService:
             ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)[:limit]
 
         best = ranked[0][1] if ranked and ranked[0][1] > 0 else 1.0
-        results = []
-        for position, score in ranked:
-            document, index = pool[position]
-            chunk = document.chunks[index]
-            score = score / best
-            results.append((
-                Document(
-                    page_content=chunk["content"],
-                    metadata={
-                        "source": document.meta["filename"],
-                        "page_number": chunk.get("page_number"),
-                        "page_end": chunk.get("page_end"),
-                        "chunk_id": index,
-                        "doc_id": document.meta["id"],
-                    },
-                ),
-                score,
-            ))
+        results = [self._hit(*pool[position], score / best) for position, score in ranked]
         return results, warnings, used_dense
+
+    @staticmethod
+    def _hit(document: StoredDocument, index: int, score: float) -> Tuple[Document, float]:
+        """
+        Đoạn thứ index của một tài liệu, kèm metadata nguồn để trích dẫn.
+        """
+        chunk = document.chunks[index]
+        return (
+            Document(
+                page_content=chunk["content"],
+                metadata={
+                    "source": document.meta["filename"],
+                    "page_number": chunk.get("page_number"),
+                    "page_end": chunk.get("page_end"),
+                    "chunk_id": index,
+                    "doc_id": document.meta["id"],
+                },
+            ),
+            float(score),
+        )
+
+    def _semantic_search(
+        self,
+        documents: Sequence[StoredDocument],
+        question: str,
+        limit: int,
+    ) -> Tuple[List[Tuple[Document, float]], List[str], str]:
+        """
+        Tìm kiếm của RAG thuần (02, 03): so độ tương đồng cosine giữa embedding của
+        nguyên văn câu hỏi và từng đoạn, lấy `limit` đoạn cao nhất. Không viết lại câu hỏi,
+        không kết hợp từ khoá. Chưa dùng được embedding thì xếp theo từ khoá (BM25).
+
+        Returns:
+            (các đoạn kèm điểm, cảnh báo, cách tìm: "ngữ nghĩa" hoặc "từ khoá")
+        """
+        embedder = self.embedder
+        dense = [
+            document for document in documents
+            if embedder is not None and document.vectors is not None
+            and document.meta.get("embedding_model") == embedder.model
+        ]
+        warnings: List[str] = []
+        if dense:
+            try:
+                query = embedder.embed_queries([question])[0]
+            except Exception as error:
+                logger.warning("Không tạo được embedding cho câu hỏi: %s", redact_secrets(error))
+                warnings.append(
+                    f"Tìm kiếm ngữ nghĩa tạm thời không dùng được ({describe_embedding_error(error)}); "
+                    "đã tìm theo từ khoá."
+                )
+            else:
+                if len(dense) < len(documents):
+                    warnings.append("Có tài liệu chưa có embedding nên chưa tìm được trong tài liệu đó.")
+                scored = [
+                    (float(score), document, index)
+                    for document in dense if document.vectors.shape[1] == query.shape[0]
+                    for index, score in enumerate(document.vectors @ query)
+                ]
+                scored.sort(key=lambda item: item[0], reverse=True)
+                return [self._hit(document, index, score) for score, document, index in scored[:limit]], warnings, "ngữ nghĩa"
+
+        pool = [(document, index) for document in documents for index in range(len(document.chunks))]
+        scores = np.asarray(BM25([tokens for document in documents for tokens in document.keyword_tokens()]).scores(tokenize(question)))
+        order = [int(position) for position in np.argsort(-scores, kind="stable")[:limit]]
+        best = scores[order[0]] if order and scores[order[0]] > 0 else 1.0
+        return [self._hit(*pool[position], scores[position] / best) for position in order], warnings, "từ khoá"
 
     def _rerank(
         self,
@@ -860,9 +910,10 @@ class WebRAGService:
         """
         Chạy một phương pháp:
         - llm:       hỏi thẳng LLM, không dùng tài liệu
-        - rag:       tìm top_n đoạn theo câu hỏi gốc -> prompt RAG cơ bản
-        - rerank:    tìm nhiều đoạn ứng viên -> LLM xếp hạng lại -> top_n -> prompt RAG cơ bản
-        - reasoning: phân tích câu hỏi -> tìm theo truy vấn con -> suy luận có trích dẫn -> kiểm chứng
+        - rag:       tìm top_n đoạn tương đồng nhất (embedding) với nguyên văn câu hỏi -> prompt RAG cơ bản
+        - rerank:    như rag nhưng lấy rerank_candidates đoạn -> LLM chấm điểm lại -> top_n -> prompt RAG cơ bản
+        - reasoning: phân tích, tách truy vấn -> tìm hybrid (từ khoá + ngữ nghĩa) theo từng truy vấn
+                     -> suy luận có trích dẫn -> kiểm chứng
 
         Args:
             llm: LLM dùng cho lần chạy này (mặc định self.llm, tự chuyển model khi hết quota)
@@ -888,7 +939,7 @@ class WebRAGService:
             timer.start(stage)
             return {"type": "status", "mode": mode, "stage": stage, "message": message, "elapsed": timer.elapsed()}
 
-        def finish(result: ReasonedAnswer, analysis: QueryAnalysis, hits=(), pipeline=()) -> Dict[str, Any]:
+        def finish(result: ReasonedAnswer, analysis: QueryAnalysis, hits=(), pipeline=(), retrieved=None, search=None) -> Dict[str, Any]:
             event = self._result_event(question, analysis, result, timer.finish(), hits)
             event.update(
                 mode=mode,
@@ -896,6 +947,8 @@ class WebRAGService:
                 models=list(llm.models),
                 usage=llm.summary(),
                 pipeline=list(pipeline),
+                retrieved=retrieved,  # số đoạn tìm được trước khi xếp hạng lại
+                search=search,  # cách tìm: "ngữ nghĩa" | "từ khoá" | "từ khoá + ngữ nghĩa"
             )
             return event
 
@@ -910,7 +963,7 @@ class WebRAGService:
             yield finish(
                 ReasonedAnswer(answer=answer.strip(), answerable=True, confidence=""),
                 QueryAnalysis("document", question, []),
-                pipeline=["Không dùng tài liệu", "LLM trả lời bằng hiểu biết sẵn có"],
+                pipeline=["Không đọc tài liệu", "LLM trả lời bằng hiểu biết sẵn có"],
             )
             return
 
@@ -920,7 +973,7 @@ class WebRAGService:
             analyzer = QueryAnalyzer(llm, self.prompts, thinking_level=self.settings.analysis_thinking_level)
             names = "\n".join(f"- {meta['filename']}" for meta in metas) or "(chưa có tài liệu nào)"
             analysis = analyzer.analyze(question, history, documents=names)
-            pipeline.append("Phân tích & viết lại câu hỏi")
+            pipeline.append(f"Phân tích câu hỏi, tách {len(analysis.sub_queries) or 1} truy vấn tìm kiếm")
 
             if analysis.category != "document":
                 reply = analysis.direct_reply or OUT_OF_SCOPE_MESSAGE
@@ -929,7 +982,7 @@ class WebRAGService:
             queries = analysis.sub_queries or [analysis.standalone_question]
             search_question = analysis.standalone_question
         else:
-            # RAG thuần: tìm theo nguyên văn câu hỏi, không viết lại / tách truy vấn
+            # 02, 03: tìm theo nguyên văn câu hỏi, không viết lại / tách truy vấn
             analysis = QueryAnalysis("document", question, [question])
             queries = [question]
             search_question = question
@@ -942,21 +995,29 @@ class WebRAGService:
         documents = [self._load_document(meta, conversation_id) for meta in metas]
         self._embed_missing(documents, conversation_id)
         limit = self.settings.rerank_candidates if use_rerank else self.settings.top_n
-        hits, warnings, used_dense = self._retrieve(documents, queries, limit=limit)
-        method = "từ khoá BM25 + ngữ nghĩa" if used_dense else "từ khoá BM25"
-        pipeline.append(f"Tìm {len(hits)} đoạn ({method})")
+        if mode == "reasoning":
+            # 04: tìm theo các truy vấn LLM đã tách, kết hợp từ khoá + ngữ nghĩa (hybrid)
+            hits, warnings, used_dense = self._retrieve(documents, queries, limit=limit)
+            search = "từ khoá + ngữ nghĩa" if used_dense else "từ khoá"
+            pipeline.append(f"Tìm {len(hits)} đoạn theo {len(queries)} truy vấn ({search})")
+        else:
+            # 02, 03: RAG thuần, chỉ so độ tương đồng với nguyên văn câu hỏi
+            hits, warnings, search = self._semantic_search(documents, question, limit)
+            target = "ứng viên" if use_rerank else "tương đồng nhất với câu hỏi"
+            pipeline.append(f"Tìm {len(hits)} đoạn {target} ({search})")
+        retrieved = len(hits)
 
         if use_rerank:
             yield status("reranking", f"Đang xếp hạng lại {len(hits)} đoạn")
             hits, rerank_warnings = self._rerank(search_question, hits, llm)
             warnings += rerank_warnings
-            pipeline.append(f"LLM xếp hạng lại, giữ {len(hits)} đoạn tốt nhất")
+            pipeline.append(f"LLM đọc và chấm điểm lại từng đoạn, giữ {len(hits)} đoạn tốt nhất")
 
         if mode == "reasoning":
             yield status("reasoning", f"Đang suy luận trên {len(hits)} đoạn trích")
             result = ReasoningAnswerer(llm, self.prompts).answer(search_question, [document for document, _ in hits])
             result.warnings = warnings + result.warnings
-            pipeline += ["Suy luận từng bước có trích dẫn", "Kiểm chứng trích dẫn với tài liệu"]
+            pipeline += ["Suy luận từng bước, trích nguyên văn làm bằng chứng", "Kiểm chứng trích dẫn với tài liệu"]
         else:
             yield status("generating", f"Đang tạo câu trả lời từ {len(hits)} đoạn")
             answer = llm.generate(
@@ -969,9 +1030,9 @@ class WebRAGService:
                 thinking_level=self.settings.thinking_level,
             )
             result = ReasonedAnswer(answer=answer.strip(), answerable=True, confidence="", warnings=warnings)
-            pipeline.append("LLM trả lời từ các đoạn tìm được")
+            pipeline.append(f"LLM trả lời từ {len(hits)} đoạn")
 
-        yield finish(result, analysis, hits, pipeline)
+        yield finish(result, analysis, hits, pipeline, retrieved, search)
 
 
 _service: Optional[WebRAGService] = None

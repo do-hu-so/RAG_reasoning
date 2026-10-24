@@ -354,6 +354,31 @@ class TestModes(WebTestCase):
         self.assertEqual(result["confidence"], "")
         self.assertIsNone(result["sources"][0]["rerank_score"])
         self.assertEqual(set(result["timings"]), {"retrieving", "generating", "total"})
+        # RAG thuần: chỉ so độ tương đồng embedding, điểm là cosine (không chuẩn hoá về 1)
+        self.assertEqual(result["search"], "ngữ nghĩa")
+        scores = [source["score"] for source in result["sources"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertLess(scores[0], 1.0)
+
+    def test_plain_rag_falls_back_to_keywords_without_embedding(self):
+        self.service = WebRAGService(self.settings, LocalStorage(self.tmp), embedder=None,
+                                     llm=self.llm, prompts=load_prompts(WEB_PROMPT_FILE))
+        set_service(self.service)
+        self.upload()
+        result = self.ask(self.QUESTION, mode="rag")[-1]
+        self.assertEqual(result["search"], "từ khoá")
+        self.assertEqual(result["sources"][0]["score"], 1.0)
+        self.assertIn("hết nhiên liệu", result["sources"][0]["content"])
+
+    def test_methods_retrieve_differently(self):
+        self.upload()
+        events = self.ask(self.QUESTION, mode="compare")
+        rag, rerank, reasoning = (self.result_of(events, mode) for mode in ("rag", "rerank", "reasoning"))
+        # 02: chỉ ngữ nghĩa, đúng top_n đoạn; 03: chọn lại từ nhiều ứng viên hơn; 04: hybrid theo truy vấn đã tách
+        self.assertEqual((rag["search"], rag["retrieved"]), ("ngữ nghĩa", self.settings.top_n))
+        self.assertEqual(rerank["search"], "ngữ nghĩa")
+        self.assertGreater(rerank["retrieved"], len(rerank["sources"]))
+        self.assertEqual(reasoning["search"], "từ khoá + ngữ nghĩa")
 
     def test_rerank_reorders_candidates(self):
         self.upload()
@@ -371,7 +396,10 @@ class TestModes(WebTestCase):
         self.assertEqual(scores, sorted(scores, reverse=True))
         # Đã chấm điểm nhiều ứng viên hơn số đoạn giữ lại
         rerank_prompt = [call for call in self.llm.calls if call["schema"] is RERANK_SCHEMA][0]["prompt"]
-        self.assertEqual(len(re.findall(r"^\[\d+\] ", rerank_prompt, re.M)), self.settings.rerank_candidates)
+        chunks = self.client.get(f"/api/conversations/{CONVERSATION}/documents").json()[0]["chunks"]
+        candidates = min(self.settings.rerank_candidates, chunks)
+        self.assertEqual(len(re.findall(r"^\[\d+\] ", rerank_prompt, re.M)), candidates)
+        self.assertEqual(result["retrieved"], candidates)
         self.assertEqual(result["usage"]["llm_calls"], 2)
 
     def test_reasoning_mode_reports_usage(self):
@@ -381,6 +409,7 @@ class TestModes(WebTestCase):
         self.assertEqual(result["usage"]["llm_calls"], 2)  # phân tích + suy luận
         self.assertTrue(result["evidence"][0]["verified"])
         self.assertIn("Kiểm chứng trích dẫn với tài liệu", result["pipeline"])
+        self.assertEqual(result["search"], "từ khoá + ngữ nghĩa")
 
     def test_compare_runs_all_modes_in_order(self):
         self.upload()

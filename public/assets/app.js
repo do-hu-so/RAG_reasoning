@@ -19,10 +19,14 @@
   var WIDE_SCREEN = 1200; // từ độ rộng này hộp trích dẫn tự mở cạnh câu trả lời
 
   var MODES = {
-    llm: { num: "01", title: "LLM thuần, không RAG", short: "LLM thuần", desc: "Chỉ hỏi LLM, không dùng tài liệu." },
-    rag: { num: "02", title: "LLM + RAG thuần", short: "RAG thuần", desc: "Tìm các đoạn liên quan rồi đưa thẳng cho LLM." },
-    rerank: { num: "03", title: "LLM + RAG + Reranking", short: "RAG + Rerank", desc: "Tìm nhiều đoạn, xếp hạng lại, giữ các đoạn tốt nhất." },
-    reasoning: { num: "04", title: "LLM + RAG + Reasoning", short: "RAG + Reasoning", desc: "Phân tích câu hỏi, suy luận có trích dẫn và kiểm chứng." },
+    llm: { num: "01", title: "LLM thuần, không RAG", short: "LLM thuần",
+      desc: "Hỏi thẳng LLM, không đọc tài liệu. Làm mốc để thấy RAG giúp được gì." },
+    rag: { num: "02", title: "LLM + RAG thuần", short: "RAG thuần",
+      desc: "Tìm các đoạn gần nghĩa nhất với nguyên văn câu hỏi (embedding) rồi đưa thẳng cho LLM. Không chấm lại đoạn, không suy luận." },
+    rerank: { num: "03", title: "LLM + RAG + Reranking", short: "RAG + Rerank",
+      desc: "Như RAG thuần nhưng lấy nhiều đoạn ứng viên hơn, rồi LLM đọc và chấm điểm lại từng đoạn, chỉ giữ các đoạn tốt nhất." },
+    reasoning: { num: "04", title: "LLM + RAG + Reasoning", short: "RAG + Reasoning",
+      desc: "LLM tách câu hỏi thành nhiều truy vấn, tìm bằng cả từ khoá và ngữ nghĩa; khi trả lời phải suy luận từng bước, trích nguyên văn và được kiểm chứng." },
     compare: { num: "⇄", title: "So sánh cả 4 phương pháp", short: "So sánh 4", desc: "Mỗi câu hỏi chạy lần lượt cả 4 cách, hiện cạnh nhau để đánh giá." }
   };
   var MODE_ORDER = ["llm", "rag", "rerank", "reasoning"];
@@ -35,7 +39,6 @@
     reasoning: "Suy luận & kiểm chứng"
   };
   var STAGE_ORDER = ["analyzing", "retrieving", "reranking", "generating", "reasoning"];
-  var WAIT_LABEL = "Chờ hạn mức Groq (không tính vào tổng)";
   var WAIT_HINT = "Thời gian chờ Groq cấp lại hạn mức token/phút để giữ cùng một model; không tính vào thời gian phản hồi.";
 
   var RATINGS = [
@@ -96,6 +99,7 @@
     citePanel: $("cite-panel"),
     citeQuestion: $("cite-panel-question"),
     citeMeta: $("cite-panel-meta"),
+    citeNote: $("cite-panel-note"),
     citeBody: $("cite-panel-body"),
     closeCite: $("close-cite")
   };
@@ -549,8 +553,6 @@
     );
   }
 
-  var CONFIDENCE_CLASS = { "cao": "cao", "trung bình": "trung-binh", "thấp": "thap" };
-
   function renderMarkdown(text, sourceCount) {
     var html;
     if (window.marked && window.DOMPurify) {
@@ -575,7 +577,7 @@
     return h("div", { class: "msg assistant" + (state.cite.msgId === msg.id ? " citing" : "") },
       h("div", { class: "avatar", html: ICONS.logo }),
       h("div", { class: "assistant-body" },
-        h("div", { class: "mode-header" }, modeTag(mode)),
+        h("div", { class: "mode-header" }, modeTag(mode), h("p", { class: "mode-desc" }, MODES[mode].desc)),
         renderRunBody(msg, mode, run, false)
       )
     );
@@ -665,7 +667,6 @@
     var sources = result.sources || [];
 
     if (total) row.append(metricChip(ICONS.clock, formatSeconds(total), timingTooltip(run, result)));
-    if (waitSeconds(run)) row.append(metricChip(null, "⏳ chờ quota " + formatSeconds(waitSeconds(run)), WAIT_HINT));
     if (usage.llm_calls) row.append(metricChip(null, usage.llm_calls + " lần gọi LLM"));
     if (usage.prompt_tokens || usage.completion_tokens) {
       row.append(metricChip(null, formatNumber(usage.prompt_tokens + usage.completion_tokens) + " token",
@@ -674,9 +675,6 @@
     if (mode !== "llm") row.append(metricChip(null, sources.length ? sources.length + " đoạn tài liệu" : "Không có đoạn tài liệu"));
     if (result.models && result.models.length) {
       row.append(metricChip(null, result.models.map(shortModel).join(", "), "Model đã trả lời"));
-    }
-    if (mode === "reasoning" && result.confidence) {
-      row.append(h("span", { class: "badge " + (CONFIDENCE_CLASS[result.confidence] || "thap") }, "Độ tin cậy: " + result.confidence));
     }
     if (mode === "reasoning" && result.evidence && result.evidence.length) {
       var verified = result.evidence.filter(function (item) { return item.verified; }).length;
@@ -794,9 +792,7 @@
   }
 
   function timingTooltip(run, result) {
-    var lines = timingRows(run, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); });
-    if (waitSeconds(run)) lines.push(WAIT_LABEL + ": " + formatSeconds(waitSeconds(run)));
-    return lines.join("\n");
+    return timingRows(run, result).map(function (row) { return row[0] + ": " + formatSeconds(row[1]); }).join("\n");
   }
 
   function renderThinking(run, result) {
@@ -831,7 +827,6 @@
       var table = h("dl", { class: "timing-table" });
       rows.forEach(function (row) { table.append(h("dt", {}, row[0]), h("dd", {}, formatSeconds(row[1]))); });
       if (total) table.append(h("dt", { class: "total" }, "Tổng thời gian phản hồi"), h("dd", { class: "total" }, formatSeconds(total)));
-      if (waitSeconds(run)) table.append(h("dt", { class: "wait" }, WAIT_LABEL), h("dd", { class: "wait" }, formatSeconds(waitSeconds(run))));
       body.append(h("h4", {}, "Thời gian xử lý"), table);
     }
     return h("details", { class: "thinking", "data-key": "thinking" }, h("summary", {}, label), body);
@@ -857,54 +852,14 @@
       var run = msg.runs[mode] || { status: "waiting" };
       var citing = state.cite.msgId === msg.id && state.cite.mode === mode;
       return h("section", { class: "mode-card " + (run.status || "waiting") + (citing ? " citing" : ""), "data-mode": mode },
-        h("header", { class: "mode-card-head" }, modeTag(mode)),
+        h("header", { class: "mode-card-head" }, modeTag(mode), h("p", { class: "mode-desc" }, MODES[mode].desc)),
         h("div", { class: "mode-card-body" }, renderRunBody(msg, mode, run, true))
       );
     }));
 
     return h("div", { class: "msg assistant compare" },
       h("div", { class: "avatar", html: ICONS.logo }),
-      h("div", { class: "assistant-body" }, head, grid, done ? renderCompareSummary(msg) : null)
-    );
-  }
-
-  function renderCompareSummary(msg) {
-    var headers = ["Phương pháp", "Thời gian", "Gọi LLM", "Token", "Đoạn tài liệu", "Model", "Độ tin cậy", "Đánh giá"];
-    var models = {};
-
-    var rows = msg.modes.map(function (mode) {
-      var run = msg.runs[mode] || {};
-      var result = run.result || {};
-      var usage = result.usage || {};
-      (result.models || []).forEach(function (name) { models[String(name).split("#")[0]] = true; });
-      var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
-      return h("tr", { class: run.rating ? "rated-" + run.rating : null },
-        h("td", {}, modeTag(mode, true)),
-        h("td", {}, run.status === "done" ? formatSeconds(responseSeconds(run)) : run.status === "error" ? "Lỗi" : "—",
-          waitSeconds(run) ? h("small", { class: "wait-note", title: WAIT_HINT }, " (+" + formatSeconds(waitSeconds(run)) + " chờ)") : null),
-        h("td", {}, usage.llm_calls || "—"),
-        h("td", {}, tokens ? formatNumber(tokens) : "—"),
-        h("td", {}, mode === "llm" ? "Không dùng" : result.sources ? String(result.sources.length) : "—"),
-        h("td", {}, (result.models || []).map(shortModel).join(", ") || "—"),
-        h("td", {}, mode === "reasoning" && result.confidence ? result.confidence : "—"),
-        h("td", { class: "rating-cell" }, ratingLabel(run.rating) || "chưa chấm")
-      );
-    });
-
-    var warning = Object.keys(models).length > 1
-      ? h("p", { class: "compare-warning" },
-        "⚠ Các phương pháp dùng model khác nhau (Groq tự chuyển model khi một model hết quota), nên so sánh chất lượng có thể chưa hoàn toàn công bằng.")
-      : null;
-
-    return h("div", { class: "compare-summary" },
-      h("div", { class: "table-wrap" },
-        h("table", { class: "compare-table" },
-          h("thead", {}, h("tr", {}, headers.map(function (text) { return h("th", {}, text); }))),
-          h("tbody", {}, rows)
-        )
-      ),
-      warning,
-      h("p", { class: "compare-hint" }, "Chấm Đúng / Một phần / Sai ở từng phương pháp, rồi bấm \"Xuất đánh giá\" ở góc trên để tải bảng CSV.")
+      h("div", { class: "assistant-body" }, head, grid)
     );
   }
 
@@ -1071,7 +1026,7 @@
     var conv = current();
     var rows = [[
       "STT", "Câu hỏi", "Phương pháp", "Thời gian (giây)", "Chờ hạn mức Groq (giây)", "Số lần gọi LLM", "Token vào", "Token ra",
-      "Số đoạn tài liệu", "Model", "Độ tin cậy", "Trích dẫn khớp", "Đánh giá", "Câu trả lời"
+      "Số đoạn tài liệu", "Model", "Trích dẫn khớp", "Đánh giá", "Câu trả lời"
     ]];
     var question = "";
     var number = 0;
@@ -1101,7 +1056,6 @@
           usage.completion_tokens || "",
           mode === "llm" ? 0 : (result.sources ? result.sources.length : ""),
           (result.models || []).map(shortModel).join(", "),
-          mode === "reasoning" ? (result.confidence || "") : "",
           evidence.length ? verified + "/" + evidence.length : "",
           ratingLabel(run.rating),
           run.status === "error" ? "LỖI: " + (run.error || "") : (result.answer || "")
@@ -1295,10 +1249,9 @@
       els.citeMeta.append(h("span", { class: "time-chip", title: timingTooltip(run, result) },
         h("span", { html: ICONS.clock }), formatSeconds(total)));
     }
-    if (reasoning && result.confidence) {
-      els.citeMeta.append(h("span", { class: "badge " + (CONFIDENCE_CLASS[result.confidence] || "thap") }, "Độ tin cậy: " + result.confidence));
-    }
     els.citeMeta.append(h("span", { class: "time-chip" }, sources.length + " đoạn trích"));
+    els.citeMeta.append(h("p", { class: "cite-how" }, citeSelectionText(mode, result, sources.length)));
+    els.citeNote.hidden = !reasoning;
 
     els.citeBody.textContent = "";
     sources.forEach(function (src) {
@@ -1322,9 +1275,10 @@
         ? (used ? "Được dùng trong câu trả lời" : "Tìm thấy nhưng không dùng trong câu trả lời")
         : "Đưa cho LLM làm ngữ cảnh";
       var hasRerank = src.rerank_score !== null && src.rerank_score !== undefined;
+      var semantic = !reasoning && result.search === "ngữ nghĩa";
       var scoreText = hasRerank
-        ? "rerank " + Number(src.rerank_score).toFixed(1) + "/10 · trước #" + src.initial_rank
-        : Number(src.score).toFixed(2);
+        ? "LLM chấm " + Number(src.rerank_score).toFixed(1) + "/10 · lúc tìm #" + src.initial_rank
+        : (semantic ? "tương đồng " : "điểm tìm ") + Number(src.score).toFixed(2);
       var pdfUrl = src.doc_id ? api("/documents/" + src.doc_id + "/file") + (src.page_number ? "#page=" + src.page_number : "") : null;
 
       els.citeBody.append(h("article", { class: "cite-card " + (used ? "cited" : "unused"), "data-index": src.index },
@@ -1333,7 +1287,11 @@
           h("span", { class: "cite-card-label", title: src.label }, src.label),
           h("span", {
             class: "cite-card-score",
-            title: hasRerank ? "Điểm LLM chấm khi xếp hạng lại / thứ hạng trước khi xếp hạng lại" : "Độ liên quan khi tìm kiếm"
+            title: hasRerank
+              ? "Điểm LLM chấm khi đọc lại đoạn này cùng câu hỏi / thứ hạng của đoạn ở bước tìm kiếm"
+              : semantic
+                ? "Độ tương đồng cosine giữa embedding của câu hỏi và đoạn này (càng gần 1 càng giống)"
+                : "Điểm của bước tìm kiếm, đoạn khớp nhất = 1.00"
           }, scoreText),
           pdfUrl ? h("a", {
             class: "cite-card-open", href: pdfUrl, target: "_blank", rel: "noopener",
@@ -1347,6 +1305,23 @@
         )
       ));
     });
+  }
+
+  /** Giải thích 6 đoạn trong hộp được chọn thế nào, theo từng phương pháp. */
+  function citeSelectionText(mode, result, count) {
+    var by = result.search === "ngữ nghĩa" ? "gần nghĩa nhất (embedding)" : result.search === "từ khoá" ? "khớp từ khoá nhất (BM25)" : "liên quan nhất";
+    if (mode === "rerank") {
+      return "Cách chọn: lấy " + (result.retrieved || "nhiều") + " đoạn " + by + " với nguyên văn câu hỏi, LLM đọc từng đoạn " +
+        "cùng câu hỏi và chấm 0–10, giữ " + count + " đoạn điểm cao nhất. Thứ tự dưới đây là thứ tự sau khi chấm lại.";
+    }
+    if (mode === "reasoning") {
+      var queries = (result.sub_queries || []).length;
+      return "Cách chọn: LLM tách câu hỏi thành " + (queries || 1) + " truy vấn, tìm theo từng truy vấn bằng " +
+        (result.search || "từ khoá + ngữ nghĩa") + " rồi gộp lại, lấy " + count + " đoạn. " +
+        "Phần tô vàng là câu LLM trích làm bằng chứng; đoạn mờ là đoạn tìm thấy nhưng không dùng.";
+    }
+    return "Cách chọn: " + count + " đoạn " + by + " với nguyên văn câu hỏi, đưa thẳng cho LLM. " +
+      "RAG thuần không viết lại câu hỏi, không chấm lại đoạn.";
   }
 
   function focusCitation(index) {
