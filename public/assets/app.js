@@ -151,9 +151,11 @@
     return Number(value || 0).toLocaleString("vi-VN");
   }
 
-  /** "groq/openai/gpt-oss-120b" -> "gpt-oss-120b" */
+  /** "groq/openai/gpt-oss-120b" -> "gpt-oss-120b"; "groq/openai/gpt-oss-20b#2" -> "gpt-oss-20b (key 2)" */
   function shortModel(name) {
-    return String(name || "").replace(/^groq\//, "").replace(/^openai\//, "");
+    var parts = String(name || "").split("#");
+    var model = parts[0].replace(/^groq\//, "").replace(/^openai\//, "");
+    return parts[1] ? model + " (key " + parts[1] + ")" : model;
   }
 
   function newId() {
@@ -874,7 +876,7 @@
       var run = msg.runs[mode] || {};
       var result = run.result || {};
       var usage = result.usage || {};
-      (result.models || []).forEach(function (name) { models[name] = true; });
+      (result.models || []).forEach(function (name) { models[String(name).split("#")[0]] = true; });
       var tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
       return h("tr", { class: run.rating ? "rated-" + run.rating : null },
         h("td", {}, modeTag(mode, true)),
@@ -1489,9 +1491,12 @@
       state.config = data;
       var storage = data.storage === "vercel-blob" ? "Vercel Blob" : data.storage === "local" ? "thư mục dataset_web/" : "chưa sẵn sàng";
       var providers = (data.llm_providers || []).map(shortModel).join(" → ") || "chưa cấu hình";
+      if (data.llm_keys > 1) providers += " (" + data.llm_keys + " key Groq)";
+      var compare = data.compare_model ? shortModel(data.compare_model) : null;
       var search = data.embedding_model ? "từ khoá + ngữ nghĩa (" + data.embedding_model + ")" : "từ khoá (BM25)";
       els.serverStatus.innerHTML =
         "<strong>Model:</strong> " + escapeHtml(providers) +
+        (compare ? "<br><strong>So sánh:</strong> " + escapeHtml(compare) : "") +
         "<br><strong>Tìm kiếm:</strong> " + escapeHtml(search) +
         "<br><strong>Lưu trữ:</strong> " + escapeHtml(storage);
       if (data.storage_error) showBanner(data.storage_error);

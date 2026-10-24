@@ -63,9 +63,9 @@ Nút chọn phương pháp nằm cạnh ô nhập câu hỏi. Mặc định là 
 - **Chấm điểm thủ công:** mỗi câu trả lời có nút Đúng / Một phần / Sai. Bảng tổng hợp dưới mỗi câu hỏi gom toàn bộ chỉ số và điểm đã chấm.
 - **Xuất đánh giá:** nút "Xuất đánh giá" trên thanh tiêu đề tải file CSV của cả cuộc trò chuyện (mở được bằng Excel / Google Sheets). Mỗi dòng gồm câu hỏi, phương pháp, các chỉ số, điểm chấm và câu trả lời.
 - **Lưu ý khi so sánh:**
-  - **Chế độ so sánh dùng cùng một model cho cả 4 phương pháp** (mặc định model đầu tiên của `GROQ_MODELS`, tức `gpt-oss-120b`; đổi bằng `COMPARE_MODEL`). Tên model hiện ở đầu khung so sánh.
-  - Một lượt so sánh tốn khoảng 15–20 nghìn token, vượt hạn mức 8.000 token/phút của `gpt-oss-120b`. Khi chạm giới hạn, app **chờ Groq cấp lại hạn mức** (theo header `retry-after`, tối đa `COMPARE_MAX_WAIT` giây mỗi lần) thay vì đổi model. Thời gian chờ hiện riêng ("⏳ chờ quota") và **không cộng vào thời gian phản hồi** của từng phương pháp, nên so sánh tốc độ vẫn công bằng.
-  - Hạn mức theo ngày của `gpt-oss-120b` (200.000 token) đủ cho khoảng 10–15 câu hỏi so sánh. Hết hạn mức ngày thì phương pháp đó báo lỗi; khi đó có thể hỏi riêng từng phương pháp (vẫn tự chuyển model) hoặc đặt `COMPARE_MODEL` sang model khác.
+  - **Chế độ so sánh dùng cùng một model cho cả 4 phương pháp** (mặc định `openai/gpt-oss-20b`, nhanh hơn `gpt-oss-120b`; đổi bằng `COMPARE_MODEL`). Tên model hiện ở đầu khung so sánh.
+  - Một lượt so sánh tốn khoảng 15–20 nghìn token, vượt hạn mức 8.000 token/phút của `gpt-oss-20b`. Nếu có nhiều key Groq, app dùng key khác (vẫn cùng model) trước. Khi chạm giới hạn, app **chờ Groq cấp lại hạn mức** (theo header `retry-after`, tối đa `COMPARE_MAX_WAIT` giây mỗi lần) thay vì đổi model. Thời gian chờ hiện riêng ("⏳ chờ quota") và **không cộng vào thời gian phản hồi** của từng phương pháp, nên so sánh tốc độ vẫn công bằng.
+  - Hạn mức theo ngày của `gpt-oss-20b` (200.000 token, bằng `gpt-oss-120b`) đủ cho khoảng 10–15 câu hỏi so sánh với mỗi key. Hết hạn mức ngày thì phương pháp đó báo lỗi; khi đó có thể hỏi riêng từng phương pháp (vẫn tự chuyển model) hoặc đặt `COMPARE_MODEL` sang model khác.
   - Khi hỏi riêng một phương pháp, app vẫn tự chuyển model khi hết quota. Nếu các phương pháp trong một lần so sánh dùng model khác nhau (tin nhắn cũ), bảng tổng hợp sẽ cảnh báo.
   - Bản web rerank bằng LLM, vì Vercel không chạy được cross-encoder; bản dòng lệnh dùng cross-encoder `bge-reranker-v2-m3`.
   - Phương pháp 04 mặc định không rerank, đúng nghĩa "RAG + Reasoning". Đặt `WEB_REASONING_RERANK=1` nếu muốn 04 gồm cả reranking.
@@ -96,11 +96,13 @@ Nếu bạn tạo Blob store ở chế độ **Public**, cần đặt thêm bi�
 
 | Việc | Dùng gì | Biến môi trường | Ghi chú |
 |---|---|---|---|
-| Trả lời | **Groq** | `GROQ_API_KEY` (bắt buộc) | Là **Groq** (chữ q), không phải **Grok** của xAI. |
+| Trả lời | **Groq** | `GROQ_API_KEY` (bắt buộc), `GROQ_API_KEY_2`… (tuỳ chọn) | Là **Groq** (chữ q), không phải **Grok** của xAI. |
 | Tìm kiếm từ khoá | BM25 trên server | — | Luôn chạy, không tốn quota. Upload không bao giờ lỗi vì hết quota. |
 | Tìm kiếm ngữ nghĩa | Cloudflare Workers AI (`@cf/baai/bge-m3`) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (tuỳ chọn) | Free tier tính theo "neuron"/ngày. Cùng model với bản dòng lệnh. |
 
 **Nhiều model Groq dự phòng cho nhau.** Groq tính hạn mức **riêng cho từng model** (ví dụ `gpt-oss-120b`: 30 request/phút, 1.000 request/ngày, 8.000 token/phút). App dùng lần lượt `GROQ_MODELS` (mặc định `openai/gpt-oss-120b, llama-3.3-70b-versatile, openai/gpt-oss-20b, llama-3.1-8b-instant`). Model nào hết quota thì app tự chuyển sang model kế tiếp; model đó được "nghỉ" theo thời gian Groq báo trong header `retry-after`. Hạn mức theo ngày của Groq đặt lại lúc 0h UTC (7h sáng giờ Việt Nam).
+
+**Nhiều API key Groq.** Thêm `GROQ_API_KEY_2` (tối đa `GROQ_API_KEY_5`) trên Vercel. Key đầu hết hạn mức thì app dùng key sau **với cùng model**, rồi mới chuyển sang model kế tiếp. Lưu ý: Groq tính hạn mức **theo tổ chức (organization)**, không theo key. Hai key tạo trong cùng một tài khoản dùng chung hạn mức nên không có tác dụng; key thứ hai phải thuộc một tổ chức khác. Hãy đọc điều khoản của Groq trước khi dùng nhiều tài khoản để tăng hạn mức. Cách chính thống là nâng lên gói Developer.
 
 **Tìm kiếm:**
 - Không cấu hình Cloudflare thì app chỉ tìm theo từ khoá, vẫn dùng bình thường.
@@ -165,9 +167,10 @@ Thư mục `dataset/` gồm file `Đề thi Procon_Tiếng Việt.pdf` và file 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `GROQ_API_KEY` | (bắt buộc) | API key Groq, lấy tại https://console.groq.com/keys |
+| `GROQ_API_KEY_2` … `GROQ_API_KEY_5` | (tuỳ chọn) | Key dự phòng của tổ chức Groq khác; key trước hết hạn mức thì dùng key sau |
 | `GROQ_MODELS` | `openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b,llama-3.1-8b-instant` | Các model theo thứ tự ưu tiên; hết quota model đầu thì dùng model sau |
 | `GROQ_REASONING_EFFORT` | `medium` | Mức suy luận của các model gpt-oss: `low`, `medium`, `high`, `off` |
-| `COMPARE_MODEL` | (model đầu tiên của `GROQ_MODELS`) | Model dùng chung cho cả 4 phương pháp ở chế độ so sánh, ví dụ `llama-3.3-70b-versatile` |
+| `COMPARE_MODEL` | `openai/gpt-oss-20b` | Model dùng chung cho cả 4 phương pháp ở chế độ so sánh, ví dụ `openai/gpt-oss-120b` |
 | `COMPARE_MAX_WAIT` | `65` | Chế độ so sánh: chờ Groq cấp lại hạn mức tối đa bấy nhiêu giây mỗi lần; cần chờ lâu hơn thì báo lỗi |
 | `COMPARE_TIME_BUDGET` | `240` | Thời gian tối đa (giây) của một lượt so sánh, để không vượt giới hạn 300 giây của Vercel |
 | `WEB_EMBEDDING_PROVIDER` | `auto` | `auto` (Cloudflare nếu có key) / `cloudflare` / `none` (chỉ tìm từ khoá) |

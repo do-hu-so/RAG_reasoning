@@ -34,6 +34,7 @@ from RAG.gen import (
     fill_template,
     is_rate_limit_error,
     load_prompts,
+    model_of,
     redact_secrets,
 )
 from RAG.reasoning import (
@@ -345,9 +346,10 @@ class WebRAGService:
 
     def compare_llm(self, deadline: Optional[float] = None) -> LLMClient:
         """
-        LLM cho chế độ so sánh: cả 4 phương pháp dùng cùng một model (COMPARE_MODEL,
-        mặc định model đầu tiên của GROQ_MODELS) để so sánh công bằng. Chạm giới hạn
-        theo phút thì chờ Groq cấp lại hạn mức thay vì chuyển sang model khác.
+        LLM cho chế độ so sánh: cả 4 phương pháp dùng cùng một model (settings.compare_model;
+        chuỗi rỗng thì model đầu tiên của GROQ_MODELS) để so sánh công bằng. Key này hết
+        hạn mức thì dùng key Groq khác (vẫn model đó); mọi key đều chạm giới hạn theo
+        phút thì chờ Groq cấp lại hạn mức thay vì chuyển sang model khác.
 
         Args:
             deadline: Mốc thời gian (time.time()) không được chờ vượt quá
@@ -359,16 +361,16 @@ class WebRAGService:
         model = self.settings.compare_model.strip()
         if model.startswith("groq/"):
             model = model[len("groq/"):]
-        name = f"groq/{model}" if model else base.names[0]
-        client = dict(base.providers).get(name)
-        if client is None:
-            # Model không nằm trong GROQ_MODELS: tạo riêng
+        target = f"groq/{model}" if model else model_of(base.names[0])
+        providers = [(name, client) for name, client in base.providers if model_of(name) == target]
+        if not providers:
+            # Model không nằm trong GROQ_MODELS: tạo riêng (với mọi key)
             try:
-                client = create_llm(models=[model], thinking_level=self.settings.thinking_level).providers[0][1]
+                providers = create_llm(models=[model], thinking_level=self.settings.thinking_level).providers
             except ValueError as error:
                 raise ServiceError(503, str(error)) from error
         return FallbackLLM(
-            [(name, client)],
+            providers,
             max_wait_seconds=self.settings.compare_max_wait,
             max_retries=COMPARE_MAX_RETRIES,
             deadline=deadline,
@@ -820,7 +822,7 @@ class WebRAGService:
 
         deadline = time.time() + self.settings.compare_time_budget
         llm = self.compare_llm(deadline)
-        pinned = llm.names[0] if isinstance(llm, FallbackLLM) else None
+        pinned = model_of(llm.names[0]) if isinstance(llm, FallbackLLM) else None
         if pinned:
             yield {"type": "compare", "model": pinned}
 

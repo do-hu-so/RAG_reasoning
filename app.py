@@ -23,7 +23,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from RAG.gen import create_llm, describe_llm
+from RAG.gen import create_llm, describe_llm, groq_api_keys
 from webapp.config import WebSettings
 from webapp.service import ServiceError, describe_error, get_service
 
@@ -56,12 +56,15 @@ def health() -> dict:
     settings = WebSettings()
     try:
         llm_providers = describe_llm(create_llm(models=settings.llm_models))
+        llm_keys = len(groq_api_keys())
     except ValueError:
-        llm_providers = []
+        llm_providers, llm_keys = [], 0
     status = {
-        # Thứ tự dự phòng: hết quota ở nhà cung cấp đầu thì chuyển sang nhà cung cấp sau
+        # Thứ tự dự phòng: hết quota ở model đầu thì chuyển sang model sau
         "llm_providers": llm_providers,
+        "llm_keys": llm_keys,
         "llm_configured": bool(llm_providers),
+        "compare_model": f"groq/{settings.compare_model}" if settings.compare_model else (llm_providers or [None])[0],
         "embedding_model": None,
         "max_upload_mb": settings.max_upload_mb,
         "max_documents": settings.max_documents_per_conversation,

@@ -405,6 +405,7 @@ class TestModes(WebTestCase):
         self.assertEqual(events[-1]["type"], "done")
 
     def use_llm(self, llm, **settings):
+        settings.setdefault("compare_model", "")  # model đầu tiên của llm
         self.settings = WebSettings(local_dataset_dir=self.tmp, **settings)
         self.service = WebRAGService(self.settings, LocalStorage(self.tmp), embedder=self.embedder,
                                      llm=llm, prompts=load_prompts(WEB_PROMPT_FILE))
@@ -442,6 +443,18 @@ class TestModes(WebTestCase):
         events = self.ask(self.QUESTION, mode="compare")
         self.assertEqual(events[0]["model"], "groq/backup")
         self.assertEqual(main.calls, [])
+
+    def test_compare_switches_key_but_keeps_model(self):
+        key1, key2, other = RateLimitedLLM(limited_calls=99, retry_after=600), FakeLLM(), FakeLLM()
+        self.use_llm(FallbackLLM([("groq/openai/gpt-oss-20b", key1), ("groq/openai/gpt-oss-20b#2", key2),
+                                  ("groq/llama", other)]), compare_model="openai/gpt-oss-20b")
+        self.upload()
+        events = self.ask(self.QUESTION, mode="compare")
+        self.assertEqual(events[0], {"type": "compare", "model": "groq/openai/gpt-oss-20b"})
+        results = [event for event in events if event["type"] == "result"]
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(result["models"] == ["groq/openai/gpt-oss-20b#2"] for result in results))
+        self.assertEqual(other.calls, [])  # không đổi sang model khác
 
     def test_compare_reports_pinned_model_quota_error(self):
         main = RateLimitedLLM(limited_calls=99, retry_after=600)  # hết hạn mức lâu: không chờ
@@ -667,6 +680,34 @@ class TestProviders(unittest.TestCase):
 
         with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="g", GROQ_MODELS=" a , b, a ,"), clear=True):
             self.assertEqual(describe_llm(create_llm()), ["groq/a", "groq/b"])
+
+    def test_create_llm_with_several_keys(self):
+        from unittest import mock
+        base = {k: v for k, v in os.environ.items() if not k.startswith("GROQ_")}
+
+        # Key thứ hai: cùng model thử lần lượt từng key, rồi mới sang model sau; key trùng / trống bị bỏ
+        keys = dict(base, GROQ_API_KEY="gsk_one", GROQ_API_KEY_2="gsk_two", GROQ_API_KEY_3="gsk_one", GROQ_API_KEY_4=" ")
+        with mock.patch.dict(os.environ, keys, clear=True):
+            llm = create_llm(models="a, b")
+            self.assertEqual(llm.names, ["groq/a", "groq/a#2", "groq/b", "groq/b#2"])
+            self.assertEqual([client._headers["Authorization"] for _, client in llm.providers],
+                             ["Bearer gsk_one", "Bearer gsk_two"] * 2)
+            self.assertEqual(describe_llm(llm), ["groq/a", "groq/b"])
+
+        # Chỉ có key thứ hai cũng chạy được
+        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY_2="gsk_two"), clear=True):
+            self.assertEqual(create_llm(models="a").names, ["groq/a"])
+
+        # Key sai định dạng: báo tên biến, không lộ giá trị
+        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY="gsk_one", GROQ_API_KEY_2="gsk sai"), clear=True):
+            with self.assertRaises(ValueError) as caught:
+                create_llm(models="a")
+            self.assertIn("GROQ_API_KEY_2", str(caught.exception))
+            self.assertNotIn("gsk sai", str(caught.exception))
+
+        with mock.patch.dict(os.environ, dict(base, GROQ_API_KEY_2="gsk_secret_value_2"), clear=True):
+            from RAG.gen import redact_secrets
+            self.assertNotIn("gsk_secret_value_2", redact_secrets("lỗi với key gsk_secret_value_2"))
 
     def test_fallback_waits_when_every_model_is_briefly_limited(self):
         attempts = []

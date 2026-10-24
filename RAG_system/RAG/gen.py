@@ -5,6 +5,8 @@ Module này chịu trách nhiệm:
 - Gọi các model của Groq qua API tương thích OpenAI (free tier rộng)
 - Tự chuyển sang model kế tiếp khi một model hết quota / lỗi (FallbackLLM);
   Groq tính hạn mức riêng cho từng model nên nhiều model = nhiều quota hơn
+- Dùng được nhiều API key Groq (GROQ_API_KEY, GROQ_API_KEY_2, ...): key này hết
+  hạn mức thì dùng key sau, vẫn cùng model
 - Hỗ trợ output JSON (JSON object mode) và mức suy luận (reasoning_effort)
 - Đọc cấu hình prompt từ file YAML
 
@@ -98,8 +100,12 @@ def fill_template(template: str, **values: str) -> str:
     return template
 
 
+# Các biến chứa API key Groq theo thứ tự ưu tiên. Groq tính hạn mức theo tổ chức (organization),
+# nên key thứ hai chỉ có ích khi thuộc một tổ chức khác với key đầu
+GROQ_KEY_ENV_VARS = ("GROQ_API_KEY",) + tuple(f"GROQ_API_KEY_{number}" for number in range(2, 6))
+
 # Biến môi trường chứa thông tin bí mật: không bao giờ được xuất hiện trong thông báo lỗi
-SECRET_ENV_VARS = ("GROQ_API_KEY", "CLOUDFLARE_API_TOKEN", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN")
+SECRET_ENV_VARS = GROQ_KEY_ENV_VARS + ("CLOUDFLARE_API_TOKEN", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN")
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 
 
@@ -414,6 +420,44 @@ def parse_models(models: Union[str, Sequence[str], None]) -> List[str]:
     return result
 
 
+def groq_api_keys(api_key: Optional[str] = None) -> List[str]:
+    """
+    Các API key Groq theo thứ tự ưu tiên: api_key nếu truyền vào, không thì
+    GROQ_API_KEY, GROQ_API_KEY_2, ... (bỏ biến trống, bỏ key trùng).
+
+    Raises:
+        ValueError: Khi không có key nào, hoặc một key sai định dạng
+    """
+    values = [(api_key, "GROQ_API_KEY")] if api_key else [(os.getenv(name), name) for name in GROQ_KEY_ENV_VARS]
+    keys: List[str] = []
+    for value, name in values:
+        if not clean_secret(value):
+            continue
+        key = require_token(value, name)
+        if key not in keys:
+            keys.append(key)
+    if not keys:
+        raise ValueError(
+            "Chưa có GROQ_API_KEY. Lấy key tại https://console.groq.com/keys rồi đặt vào file .env "
+            "(hoặc Environment Variables trên Vercel)."
+        )
+    return keys
+
+
+def provider_name(model: str, key_number: int = 1) -> str:
+    """
+    Tên hiển thị của một cặp (model, key): "groq/<model>", key thứ 2 trở đi thêm "#<số>".
+    """
+    return f"groq/{model}" if key_number == 1 else f"groq/{model}#{key_number}"
+
+
+def model_of(name: str) -> str:
+    """
+    "groq/openai/gpt-oss-20b#2" -> "groq/openai/gpt-oss-20b" (bỏ số thứ tự key).
+    """
+    return name.split("#", 1)[0]
+
+
 def create_llm(
     models: Union[str, Sequence[str], None] = None,
     thinking_level: Optional[str] = DEFAULT_THINKING_LEVEL,
@@ -425,26 +469,25 @@ def create_llm(
     Args:
         models: Danh sách model theo thứ tự ưu tiên (mặc định biến GROQ_MODELS hoặc DEFAULT_LLM_MODELS)
         thinking_level: Mức suy luận mặc định
-        api_key: API key; mặc định đọc GROQ_API_KEY
+        api_key: API key; mặc định đọc GROQ_API_KEY, GROQ_API_KEY_2, ...
 
     Returns:
-        FallbackLLM gồm các model theo thứ tự (kể cả khi chỉ có một model,
-        để vẫn có chờ-rồi-thử-lại khi chạm giới hạn theo phút)
+        FallbackLLM gồm các cặp (model, key) theo thứ tự: model đầu với lần lượt từng key,
+        rồi mới đến model sau (kể cả khi chỉ có một cặp, để vẫn có chờ-rồi-thử-lại khi
+        chạm giới hạn theo phút)
 
     Raises:
-        ValueError: Khi chưa có GROQ_API_KEY
+        ValueError: Khi chưa có GROQ_API_KEY hoặc key sai định dạng
     """
-    if not clean_secret(api_key or os.getenv("GROQ_API_KEY")):
-        raise ValueError(
-            "Chưa có GROQ_API_KEY. Lấy key tại https://console.groq.com/keys rồi đặt vào file .env "
-            "(hoặc Environment Variables trên Vercel)."
-        )
-    api_key = require_token(api_key or os.getenv("GROQ_API_KEY"), "GROQ_API_KEY")
-
+    keys = groq_api_keys(api_key)
     names = parse_models(models if models is not None else os.getenv("GROQ_MODELS"))
     providers: List[Tuple[str, LLMClient]] = [
-        (f"groq/{model}", OpenAICompatibleClient("groq", GROQ_BASE_URL, api_key, model, thinking_level=thinking_level))
+        (
+            provider_name(model, number),
+            OpenAICompatibleClient("groq", GROQ_BASE_URL, key, model, thinking_level=thinking_level),
+        )
         for model in names
+        for number, key in enumerate(keys, start=1)
     ]
     return FallbackLLM(providers)
 
@@ -452,7 +495,8 @@ def create_llm(
 def describe_llm(llm: Any) -> List[str]:
     """
     Tên các model của một LLM (để hiển thị), ví dụ ["groq/openai/gpt-oss-120b", "groq/llama-3.3-70b-versatile"].
+    Mỗi model chỉ ghi một lần dù dùng nhiều key.
     """
     if isinstance(llm, FallbackLLM):
-        return llm.names
+        return list(dict.fromkeys(model_of(name) for name in llm.names))
     return [f"{getattr(llm, 'name', 'llm')}/{getattr(llm, 'model', '')}"]

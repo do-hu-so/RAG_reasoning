@@ -26,6 +26,8 @@ DATASET_WEB_NAME = "dataset_web"
 LOCAL_DATASET_DIR = PROJECT_ROOT / DATASET_WEB_NAME
 
 DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3"
+# Model dùng chung cho cả 4 phương pháp ở chế độ so sánh
+DEFAULT_COMPARE_MODEL = "openai/gpt-oss-20b"
 
 
 def _env_str(name: str, default: str) -> str:
@@ -48,8 +50,8 @@ class WebSettings:
     thinking_level: str = field(default_factory=lambda: _env_str("GROQ_REASONING_EFFORT", DEFAULT_THINKING_LEVEL))
     analysis_thinking_level: str = DEFAULT_ANALYSIS_THINKING_LEVEL
 
-    # Chế độ so sánh: cả 4 phương pháp dùng cùng một model (mặc định model đầu tiên của GROQ_MODELS)
-    compare_model: str = field(default_factory=lambda: _env_str("COMPARE_MODEL", ""))
+    # Chế độ so sánh: cả 4 phương pháp dùng cùng một model (mặc định gpt-oss-20b)
+    compare_model: str = field(default_factory=lambda: _env_str("COMPARE_MODEL", DEFAULT_COMPARE_MODEL))
     # Chạm giới hạn token/phút thì chờ Groq cấp lại hạn mức, tối đa bấy nhiêu giây mỗi lần (không đổi model)
     compare_max_wait: int = field(default_factory=lambda: _env_int("COMPARE_MAX_WAIT", 65))
     # Thời gian tối đa của một lượt so sánh (Vercel Hobby dừng hàm sau 300 giây)
