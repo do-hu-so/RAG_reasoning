@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 from langchain_core.documents import Document
 
-from RAG.gen import LLMClient, create_llm, fill_template, is_rate_limit_error, load_prompts
+from RAG.gen import LLMClient, create_llm, fill_template, is_rate_limit_error, load_prompts, redact_secrets
 from RAG.reasoning import (
     QueryAnalysis,
     QueryAnalyzer,
@@ -217,7 +217,7 @@ def describe_error(error: Exception) -> str:
         return f"Model của {provider} không tồn tại hoặc đã ngừng hỗ trợ. Kiểm tra biến GROQ_MODELS rồi deploy lại."
     if code is not None and code >= 500:
         return f"Dịch vụ {provider} đang gặp sự cố tạm thời. Vui lòng thử lại."
-    return f"Đã xảy ra lỗi: {text}"
+    return f"Đã xảy ra lỗi: {redact_secrets(text)}"
 
 
 def describe_embedding_error(error: Exception) -> str:
@@ -277,6 +277,8 @@ class WebRAGService:
         self._embedder = None if embedder is AUTO else embedder
         self._embedder_ready = embedder is not AUTO
         self._embedding_rest_until = 0.0
+        # Lỗi cấu hình embedding (vd. token sai định dạng) để hiển thị trên giao diện
+        self.embedding_error: Optional[str] = None
         self._llm = llm
         self.prompts = prompts or load_prompts(settings.prompt_file)
         self._cache: "OrderedDict[str, StoredDocument]" = OrderedDict()
@@ -297,8 +299,9 @@ class WebRAGService:
                         self.settings.embedding_model,
                     )
                 except ValueError as error:
-                    logger.warning("Không tạo được embedder (%s), chỉ dùng tìm kiếm từ khoá.", error)
+                    logger.warning("Không tạo được embedder (%s), chỉ dùng tìm kiếm từ khoá.", redact_secrets(error))
                     self._embedder = None
+                    self.embedding_error = redact_secrets(error)
                 self._embedder_ready = True
             return self._embedder
 
@@ -397,7 +400,7 @@ class WebRAGService:
                     title=PurePath(stored_name).stem,
                 )
             except Exception as error:
-                logger.warning("Không tạo được embedding cho %s: %s", filename, error)
+                logger.warning("Không tạo được embedding cho %s: %s", filename, redact_secrets(error))
                 warning = (
                     f"Chưa tạo được embedding: {describe_embedding_error(error)}. "
                     "Tài liệu vẫn hỏi được bằng tìm kiếm từ khoá."
@@ -542,7 +545,7 @@ class WebRAGService:
                     title=PurePath(document.meta["stored_name"]).stem,
                 )
             except Exception as error:
-                logger.warning("Chưa bổ sung được embedding cho %s: %s", document.meta["filename"], error)
+                logger.warning("Chưa bổ sung được embedding cho %s: %s", document.meta["filename"], redact_secrets(error))
                 if is_rate_limit_error(error):
                     self._embedding_rest_until = time.time() + EMBEDDING_REST_SECONDS
                 return
@@ -610,7 +613,7 @@ class WebRAGService:
             try:
                 query_vectors = embedder.embed_queries(list(queries))
             except Exception as error:
-                logger.warning("Không tạo được embedding cho câu hỏi: %s", error)
+                logger.warning("Không tạo được embedding cho câu hỏi: %s", redact_secrets(error))
                 query_vectors = None
                 warnings.append(
                     f"Tìm kiếm ngữ nghĩa tạm thời không dùng được ({describe_embedding_error(error)}); "
@@ -675,7 +678,7 @@ class WebRAGService:
         try:
             scores = reranker.score(question, [document.page_content for document, _ in hits])
         except Exception as error:
-            logger.warning("Reranking lỗi: %s", error)
+            logger.warning("Reranking lỗi: %s", redact_secrets(error))
             return hits[:top_n], [f"Không xếp hạng lại được ({describe_error(error)}); dùng thứ tự tìm kiếm ban đầu."]
 
         order = sorted(range(len(hits)), key=lambda position: (-scores[position], position))[:top_n]

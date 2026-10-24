@@ -71,6 +71,7 @@ def health() -> dict:
         status["storage"] = service.storage.name
         embedder = service.embedder
         status["embedding_model"] = embedder.model if embedder is not None else None
+        status["embedding_error"] = service.embedding_error
     except ServiceError as error:
         status["storage"] = None
         status["storage_error"] = error.message

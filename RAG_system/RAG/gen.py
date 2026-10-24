@@ -15,6 +15,7 @@ Version: 4.0.0
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -95,6 +96,56 @@ def fill_template(template: str, **values: str) -> str:
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)
     return template
+
+
+# Biến môi trường chứa thông tin bí mật: không bao giờ được xuất hiện trong thông báo lỗi
+SECRET_ENV_VARS = ("GROQ_API_KEY", "CLOUDFLARE_API_TOKEN", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN")
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+
+
+def clean_secret(value: Optional[str]) -> str:
+    """
+    Lấy đúng phần key / token khi người dùng lỡ dán kèm "Bearer", dấu nháy,
+    khoảng trắng hoặc cả lệnh curl mẫu (… -H "Authorization: Bearer <token>").
+    """
+    text = (value or "").strip()
+    match = re.search(r"Bearer\s+([A-Za-z0-9._~+/=-]+)", text)
+    if match:
+        text = match.group(1)
+    return text.strip().strip("'\"")
+
+
+def require_token(value: Optional[str], name: str) -> str:
+    """
+    Làm sạch và kiểm tra một key / token đọc từ biến môi trường.
+
+    Raises:
+        ValueError: Khi thiếu hoặc sai định dạng (thông báo không chứa giá trị token)
+    """
+    token = clean_secret(value)
+    if not token:
+        raise ValueError(f"Chưa có {name}.")
+    if not TOKEN_PATTERN.match(token):
+        raise ValueError(
+            f"{name} không đúng định dạng: ô Value chỉ được chứa chuỗi key / token "
+            "(không kèm lệnh curl, khoảng trắng hay xuống dòng)."
+        )
+    return token
+
+
+def redact_secrets(text: Any) -> str:
+    """
+    Che các key / token trong một chuỗi (thông báo lỗi, log) trước khi hiển thị.
+    """
+    text = re.sub(r"(Bearer\s+)[^\s\"'\\]+", r"\1***", str(text))
+    for name in SECRET_ENV_VARS:
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        for secret in {raw.strip(), clean_secret(raw)}:
+            if len(secret) >= 8:
+                text = text.replace(secret, "***")
+    return text
 
 
 class ProviderError(Exception):
@@ -302,7 +353,7 @@ class FallbackLLM:
                         waits.append(rest)
                     else:
                         waits.append(None)
-                    logger.warning("LLM %s lỗi (%s), chuyển sang model kế tiếp.", name, error)
+                    logger.warning("LLM %s lỗi (%s), chuyển sang model kế tiếp.", name, redact_secrets(error))
 
             # Tất cả đều chỉ bị giới hạn theo phút -> chờ model sớm nhất rồi thử lại một lần
             shortest = min((wait for wait in waits if wait is not None), default=None)
@@ -348,12 +399,12 @@ def create_llm(
     Raises:
         ValueError: Khi chưa có GROQ_API_KEY
     """
-    api_key = api_key or os.getenv("GROQ_API_KEY")
-    if not api_key:
+    if not clean_secret(api_key or os.getenv("GROQ_API_KEY")):
         raise ValueError(
             "Chưa có GROQ_API_KEY. Lấy key tại https://console.groq.com/keys rồi đặt vào file .env "
             "(hoặc Environment Variables trên Vercel)."
         )
+    api_key = require_token(api_key or os.getenv("GROQ_API_KEY"), "GROQ_API_KEY")
 
     names = parse_models(models if models is not None else os.getenv("GROQ_MODELS"))
     providers: List[Tuple[str, LLMClient]] = [

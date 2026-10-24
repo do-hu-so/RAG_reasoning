@@ -103,7 +103,8 @@ Nếu bạn tạo Blob store ở chế độ **Public**, cần đặt thêm bi�
 - Không cấu hình Cloudflare thì app chỉ tìm theo từ khoá, vẫn dùng bình thường.
 - Lấy thông tin Cloudflare:
   - **Account ID:** bấm **Search** (hoặc `Ctrl+K`) trong dashboard, gõ `Copy account ID` rồi chọn kết quả. Hoặc vào **Workers & Pages**, xem mục **Account Details**.
-  - **API Token:** vào **My Profile → API Tokens**, tạo token có quyền **Workers AI**.
+  - **API Token:** vào **My Profile → API Tokens**, tạo token có quyền **Workers AI**. Ô **Value** trên Vercel chỉ dán **chuỗi token**, không dán cả lệnh `curl` mẫu. Nếu lỡ dán, app vẫn tự tách được token, nhưng nên dán đúng ngay từ đầu.
+  - Lỡ để lộ token (dán vào chat, chụp màn hình...) thì vào **API Tokens** chọn **Roll** (hoặc xoá rồi tạo mới), sau đó cập nhật lại biến trên Vercel.
 - Embedding lỗi lúc upload: tài liệu vẫn được lưu, có cảnh báo, và vẫn hỏi được bằng từ khoá. Khi embedding dùng được trở lại, tài liệu **tự được bổ sung embedding ở lần hỏi kế tiếp**, không cần upload lại. Nếu lại hết quota, app tạm ngừng thử 15 phút.
 - Embedding câu hỏi lỗi lúc hỏi: app tự dùng tìm kiếm từ khoá và ghi chú điều đó trong câu trả lời.
 

@@ -11,11 +11,12 @@ Version: 3.0.0
 
 import logging
 import os
+import re
 from typing import Any, List, Optional, Protocol, Sequence
 
 import numpy as np
 
-from RAG.gen import ProviderError
+from RAG.gen import ProviderError, clean_secret, require_token
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,20 @@ class CloudflareEmbedder:
     ) -> None:
         import httpx
 
-        account_id = account_id or os.getenv("CLOUDFLARE_ACCOUNT_ID")
-        api_token = api_token or os.getenv("CLOUDFLARE_API_TOKEN")
-        if not account_id or not api_token:
+        account_id = account_id or os.getenv("CLOUDFLARE_ACCOUNT_ID") or ""
+        api_token = api_token or os.getenv("CLOUDFLARE_API_TOKEN") or ""
+        if not account_id.strip() or not clean_secret(api_token):
             raise ValueError("Chưa có CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN để tạo embedding.")
+
+        # Account ID là chuỗi 32 ký tự hex; lấy đúng phần đó nếu lỡ dán cả URL dashboard
+        match = re.search(r"[0-9a-fA-F]{32}", account_id)
+        if not match:
+            raise ValueError(
+                "CLOUDFLARE_ACCOUNT_ID không đúng định dạng: cần chuỗi 32 ký tự (chữ a–f và số), "
+                "lấy bằng cách nhấn Ctrl+K trong dashboard Cloudflare rồi chọn \"Copy account ID\"."
+            )
+        account_id = match.group(0).lower()
+        api_token = require_token(api_token, "CLOUDFLARE_API_TOKEN")
 
         self.model = model
         self.batch_size = batch_size

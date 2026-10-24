@@ -644,15 +644,15 @@ class TestProviders(unittest.TestCase):
             return httpx.Response(200, json={"success": True, "result": {
                 "shape": [len(body["text"]), 3], "data": [[3.0, 4.0, 0.0] for _ in body["text"]]}})
 
-        embedder = CloudflareEmbedder(account_id="acc", api_token="tok", batch_size=2, http_client=mock_http(handler))
+        embedder = CloudflareEmbedder(account_id="0123456789abcdef0123456789abcdef", api_token="tok", batch_size=2, http_client=mock_http(handler))
         vectors = embedder.embed_documents(["a", "b", "c"])
         self.assertEqual(vectors.shape, (3, 3))
         np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, rtol=1e-6)
-        self.assertEqual(seen[0][0], "https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/baai/bge-m3")
+        self.assertEqual(seen[0][0], "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/run/@cf/baai/bge-m3")
         self.assertEqual([len(body["text"]) for _, body in seen], [2, 1])
         self.assertTrue(seen[0][1]["truncate_inputs"])
 
-        broken = CloudflareEmbedder(account_id="acc", api_token="tok", http_client=mock_http(
+        broken = CloudflareEmbedder(account_id="0123456789abcdef0123456789abcdef", api_token="tok", http_client=mock_http(
             lambda request: httpx.Response(200, json={"result": {"data": []}})))
         with self.assertRaises(ProviderError):
             broken.embed_queries(["q"])
@@ -664,7 +664,7 @@ class TestProviders(unittest.TestCase):
             self.assertIsNone(create_embedder("auto"))  # không có Cloudflare -> chỉ tìm từ khoá
             with self.assertRaises(ValueError):
                 create_embedder("cloudflare")
-        with mock.patch.dict(os.environ, dict(base, CLOUDFLARE_ACCOUNT_ID="a", CLOUDFLARE_API_TOKEN="t"), clear=True):
+        with mock.patch.dict(os.environ, dict(base, CLOUDFLARE_ACCOUNT_ID="0123456789abcdef0123456789abcdef", CLOUDFLARE_API_TOKEN="t"), clear=True):
             self.assertIsInstance(create_embedder("auto"), CloudflareEmbedder)
             self.assertIsNone(create_embedder("none"))
 
@@ -693,6 +693,76 @@ class TestStorageSelection(unittest.TestCase):
         for name in ("BLOB_STORE_ID", "BLOB_READ_WRITE_TOKEN", "VERCEL_BLOB_READ_WRITE_TOKEN"):
             with mock.patch.dict(os.environ, dict(clean, VERCEL="1", **{name: "store_abc"}), clear=True):
                 self.assertIsInstance(create_storage(settings), BlobStorage)
+
+
+class TestSecrets(unittest.TestCase):
+    """Key / token dán sai định dạng và việc che bí mật trong thông báo lỗi."""
+
+    TOKEN = "cfut_FAKE0123456789abcdefTOKEN"
+    CURL = ('curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \\\n'
+            ' -H "Authorization: Bearer cfut_FAKE0123456789abcdefTOKEN"')
+    ACCOUNT = "0123456789abcdef0123456789abcdef"
+
+    def test_clean_secret_extracts_token(self):
+        from RAG.gen import clean_secret
+        for value in (self.TOKEN, f"  {self.TOKEN}\n", f'"{self.TOKEN}"', f"Bearer {self.TOKEN}", self.CURL):
+            self.assertEqual(clean_secret(value), self.TOKEN)
+
+    def test_cloudflare_embedder_accepts_pasted_curl_and_dashboard_url(self):
+        seen = []
+
+        def handler(request):
+            seen.append((str(request.url), request.headers["authorization"]))
+            return httpx.Response(200, json={"result": {"data": [[1.0, 0.0]]}})
+
+        embedder = CloudflareEmbedder(account_id=f"https://dash.cloudflare.com/{self.ACCOUNT}/home",
+                                      api_token=self.CURL, http_client=mock_http(handler))
+        embedder.embed_queries(["q"])
+        self.assertEqual(seen[0][0], f"https://api.cloudflare.com/client/v4/accounts/{self.ACCOUNT}/ai/run/@cf/baai/bge-m3")
+        self.assertEqual(seen[0][1], f"Bearer {self.TOKEN}")
+
+    def test_invalid_values_rejected_without_leaking(self):
+        with self.assertRaises(ValueError) as caught:
+            CloudflareEmbedder(account_id=self.ACCOUNT, api_token="token có khoảng trắng")
+        self.assertIn("CLOUDFLARE_API_TOKEN không đúng định dạng", str(caught.exception))
+        self.assertNotIn("khoảng trắng", str(caught.exception).split(":")[0])
+        with self.assertRaises(ValueError) as caught:
+            CloudflareEmbedder(account_id="không-phải-id", api_token=self.TOKEN)
+        self.assertIn("CLOUDFLARE_ACCOUNT_ID", str(caught.exception))
+        self.assertNotIn(self.TOKEN, str(caught.exception))
+
+    def test_groq_key_cleaned(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": f"Bearer gsk_{self.ACCOUNT}"}):
+            llm = create_llm(models="m")
+            self.assertEqual(llm.providers[0][1]._headers["Authorization"], f"Bearer gsk_{self.ACCOUNT}")
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "gsk abc def"}):
+            with self.assertRaises(ValueError):
+                create_llm(models="m")
+
+    def test_error_messages_redact_secrets(self):
+        from unittest import mock
+        from RAG.gen import redact_secrets
+        from webapp.service import describe_error
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_API_TOKEN": self.CURL}):
+            leaked = f"Illegal header value b'Bearer {self.TOKEN}' / {self.TOKEN}"
+            self.assertNotIn(self.TOKEN, redact_secrets(leaked))
+            self.assertNotIn(self.TOKEN, describe_error(ValueError(leaked)))
+
+    def test_health_reports_embedding_config_error(self):
+        from unittest import mock
+        tmp = Path(tempfile.mkdtemp())
+        service = WebRAGService(WebSettings(local_dataset_dir=tmp), LocalStorage(tmp), llm=FakeLLM(),
+                                prompts=load_prompts(WEB_PROMPT_FILE))
+        set_service(service)
+        try:
+            with mock.patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": self.ACCOUNT, "CLOUDFLARE_API_TOKEN": "sai định dạng"}):
+                health = TestClient(app).get("/api/health").json()
+            self.assertIsNone(health["embedding_model"])
+            self.assertIn("CLOUDFLARE_API_TOKEN không đúng định dạng", health["embedding_error"])
+        finally:
+            set_service(None)
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestHistoryPrompt(unittest.TestCase):

@@ -1473,6 +1473,7 @@
         "<br><strong>Lưu trữ:</strong> " + escapeHtml(storage);
       if (data.storage_error) showBanner(data.storage_error);
       else if (!data.llm_configured) showBanner("Server chưa có GROQ_API_KEY nên chưa thể trả lời câu hỏi. Thêm biến này trong Environment Variables rồi Redeploy.");
+      else if (data.embedding_error) showBanner("Cấu hình Cloudflare chưa đúng nên đang chỉ tìm theo từ khoá: " + data.embedding_error);
       if (!current()) renderMessages();
     } catch (err) {
       els.serverStatus.textContent = "Không kết nối được server.";
